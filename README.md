@@ -10,7 +10,7 @@
 ![uv](https://img.shields.io/badge/uv-2C2D30?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker_Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![LLM Optimization](https://img.shields.io/badge/LLM_Optimization-FF9900?style=for-the-badge&logo=openai&logoColor=white)
+![OpenRouter](https://img.shields.io/badge/OpenRouter-DeepSeek_v4.1_Flash-7C3AED?style=for-the-badge)
 
 ---
 
@@ -40,7 +40,7 @@ POST /optimize-energy
         ▼
 2. LLM interpretation           gridwise/llm.py   →  interpret_notes()
         │   free-text notes → RAW structured directives (UNTRUSTED)
-        │   provider/model/key from env; short timeout; typed LLMError
+        │   OpenRouter (OpenAI-compatible); model/key from env; typed LLMError
         ▼
 3. Deterministic guardrails     gridwise/guardrails.py → validate_directives()
         │   pure Python: enforce shape/ranges; coerce anything
@@ -93,46 +93,48 @@ uv run uvicorn core.asgi:application --host 0.0.0.0 --port 8000
 
 ### Environment variables (names only — never commit real values)
 
-| Variable                | Required | Purpose                                                        |
-|-------------------------|----------|----------------------------------------------------------------|
-| `SECRET_KEY`            | prod     | Django secret key.                                             |
-| `DEBUG`                 | no       | `True`/`False` (default `False`).                              |
-| `ALLOWED_HOSTS`         | no       | Comma-separated hosts.                                         |
-| `DATABASE_URL`          | no       | Postgres DSN. Absent → SQLite; `/health` needs no DB.          |
-| `LLM_PROVIDER`          | yes      | Primary provider alias (`gemini`; see `LLM_PRIMARY_PROVIDER`). |
-| `LLM_PRIMARY_PROVIDER`  | no       | Primary LLM (`gemini`, default).                               |
-| `LLM_PRIMARY_MODEL`     | no       | Primary model (falls back to `LLM_MODEL`).                     |
-| `LLM_MODEL`             | yes      | Gemini model id.                                               |
-| `LLM_MODEL_FALLBACK`    | no       | Second Gemini model if the primary model overloads (503).      |
-| `LLM_API_KEY`           | yes*     | Gemini key(s), comma-separated.                                |
-| `GEMINI_API_KEY`        | no       | Alias for Gemini key.                                          |
-| `LLM_FALLBACK_PROVIDER` | no      | Backup provider (`openrouter`, default).                       |
-| `LLM_FALLBACK_MODEL`    | no       | OpenRouter model (`~deepseek/deepseek-flash-latest`).          |
-| `OPENROUTER_API_KEY`    | no**     | OpenRouter key (used only if Gemini fails).                    |
-| `LLM_BASE_URL`          | no       | OpenAI-compatible base URL (auto-set for `gemini`).            |
-| `LLM_TIMEOUT_SECONDS`   | no       | Per-provider attempt timeout (default `10`).                   |
-| `LLM_TIMEOUT`           | no       | Legacy alias for timeout seconds.                              |
+All LLM settings are read from `gridwise/llm_env.py`. **OpenRouter is the only
+provider** (no multi-provider fallback in code).
 
-\* Required for Gemini unless fallback alone is acceptable in dev.  
-\** Required for OpenRouter fallback when Gemini is unavailable.
+| Variable               | Required | Purpose |
+|------------------------|----------|---------|
+| `SECRET_KEY`           | prod     | Django secret key. |
+| `DEBUG`                | no       | `True`/`False` (default `False`). |
+| `ALLOWED_HOSTS`        | no       | Comma-separated hosts. |
+| `DATABASE_URL`         | no       | Postgres DSN. Absent → SQLite; `/health` needs no DB. |
+| `OPENROUTER_API_KEY`   | yes*     | OpenRouter key(s), comma-separated (rotation on auth/`429`). |
+| `LLM_MODEL`            | no       | OpenRouter model id (default `deepseek/deepseek-v4.1-flash`). |
+| `LLM_BASE_URL`         | no       | API base (default `https://openrouter.ai/api/v1`). |
+| `LLM_REASONING`        | no       | `off` (default, fastest) · `low`/`medium`/`high` · or omit for model default. |
+| `LLM_TIMEOUT`          | no       | Read timeout seconds; `0` = disabled (slow free tier can finish). |
+| `LLM_TIMEOUT_SECONDS`  | no       | Alias for `LLM_TIMEOUT`. |
+| `LLM_CONNECT_TIMEOUT`  | no       | Connect timeout when read timeout is off (default `30`). |
+| `LLM_MAX_RETRIES`      | no       | Retries on transient errors / bad JSON (default `3`). |
+| `LLM_RETRY_BACKOFF`    | no       | Exponential backoff base seconds (default `0.5`). |
+| `LLM_DEADLINE`         | no       | Overall retry budget; `0` = unlimited (retries capped by `LLM_MAX_RETRIES`). |
+| `LLM_MAX_TOKENS`       | no       | Cap completion tokens (else scales with note count). |
+| `LLM_CACHE_SIZE`       | no       | LRU cache entries for identical note lists (default `256`). |
 
-## Model / provider and how to switch
+\* Required for `POST /optimize-energy` unless you only use `GET /health`.
 
-The LLM layer speaks the **OpenAI-compatible** Chat Completions API, so any
-provider exposing that surface works by setting env vars only — no code change.
+## LLM: OpenRouter + DeepSeek
+
+Interpretation uses **OpenRouter** with the **OpenAI-compatible** Chat
+Completions API (`gridwise/llm_providers.py`). The deployed default model is
+**`deepseek/deepseek-v4.1-flash`** — fast structured JSON for operator notes.
+
+Copy from `.env.example` and set your key:
 
 ```bash
-# Google Gemini (primary) + OpenRouter DeepSeek (provider fallback)
-LLM_PRIMARY_PROVIDER=gemini
-LLM_PRIMARY_MODEL=gemini-3.6-flash
-LLM_MODEL=gemini-3.6-flash
-LLM_FALLBACK_PROVIDER=openrouter
-LLM_FALLBACK_MODEL=~deepseek/deepseek-flash-latest
-LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-LLM_API_KEY=<gemini-key>
-OPENROUTER_API_KEY=<openrouter-key>
-LLM_TIMEOUT_SECONDS=10
+OPENROUTER_API_KEY=<your-key>
+LLM_MODEL=deepseek/deepseek-v4.1-flash
+LLM_REASONING=off          # disable chain-of-thought on free-tier routes
+LLM_TIMEOUT=0              # no read cap; connect still times out at 30s
+LLM_MAX_RETRIES=3
+LLM_DEADLINE=0
 ```
+
+To try another OpenRouter model, change `LLM_MODEL` only (same key and base URL).
 
 ## API examples
 
@@ -199,29 +201,24 @@ discharge**, `0` when idle, so `battery_energy_after_kwh[h] =
 battery_energy_after_kwh[h-1] + battery_kwh[h]`. Every total is recomputed from
 `hourly_plan`.
 
-**Status codes:** `200` success (via the LLM, or the deterministic fallback if
-the LLM failed) · `400` malformed JSON · `422` well-formed but invalid · `500`
-controlled error (guardrail/optimizer/unexpected failure; no stack traces or
-secrets, never crashes).
+**Status codes:** `200` success · `400` malformed JSON · `422` well-formed but
+invalid · `500` controlled error (LLM outage after retries, guardrail/optimizer
+failure, or unexpected error; no stack traces or secrets).
 
 ## Reliability & performance
 
-Everything is engineered to stay up within a **30s/request** budget and target
-**≤5s p95**, and to protect interpretation quality when the LLM is slow or flaky:
+Everything is engineered to stay within a **30s/request** budget and target
+**≤5s p95** where the model responds quickly:
 
-- **Provider fallback (Gemini → OpenRouter).** One controlled attempt on Gemini
-  (with optional comma-separated key rotation on auth/`429`). On any provider
-  failure — missing key, auth, quota/`429`, timeout, network, `5xx`, malformed
-  JSON, or schema validation failure — OpenRouter DeepSeek is called **once**
-  with the **same prompt and JSON schema**. Valid `no_op` results never trigger
-  fallback. Successful Gemini responses never call OpenRouter.
-- **Deterministic keyword fallback** (`gridwise/fallback.py`). Used **only** when
-  **both** LLM providers raise `LLMError`: keyword/clock parsing still yields a
-  valid schedule (`fallback_used=true` in logs).
-- **In-memory cache** keyed by the exact `operator_notes` list, cutting p95 for
-  repeated interpretations (`LLM_CACHE_SIZE` entries, thread-safe LRU).
+- **OpenRouter with retries.** Transient timeouts, connection errors, `5xx`, and
+  malformed JSON responses are retried with exponential backoff (env-tuned).
+  Comma-separated `OPENROUTER_API_KEY` values rotate on auth failures and `429`.
+- **`LLM_REASONING=off`** by default so free-tier reasoning models skip slow
+  chain-of-thought tokens.
+- **In-memory LRU cache** keyed by `operator_notes` (+ battery capacity), sized by
+  `LLM_CACHE_SIZE`, for repeat interpretations.
 - **Structured logging** of `scenario_id`, `path`, `status`, `latency_ms`,
-  `fallback_used` — and never API keys, prompt text, or full request bodies.
+  `llm_provider` — never API keys, prompt text, or full request bodies.
 
 ## Reproducibility test — replay checker
 
@@ -309,10 +306,9 @@ heroku config:set -a your-app \
   SECRET_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(50))')" \
   DEBUG=False \
   ALLOWED_HOSTS="your-app.herokuapp.com" \
-  LLM_PROVIDER=gemini LLM_MODEL=gemini-3.6-flash \
-  LLM_MODEL_FALLBACK=gemini-3.8-flash \
-  LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/" \
-  LLM_API_KEY="<your-key>"
+  OPENROUTER_API_KEY="<your-key>" \
+  LLM_MODEL=deepseek/deepseek-v4.1-flash \
+  LLM_REASONING=off
 git push heroku main          # builds Dockerfile; release runs migrate + seed
 ```
 
@@ -329,9 +325,8 @@ enabled in production (the app trusts `X-Forwarded-Proto`).
 | `DEBUG` | `False` in production |
 | `ALLOWED_HOSTS` | your public host(s), comma-separated |
 | `DATABASE_URL` | optional; set it to enable audit logging + migrations |
-| `LLM_PROVIDER`, `LLM_MODEL` | required |
-| `LLM_API_KEY` | required (or `<PROVIDER>_API_KEY`) |
-| `LLM_MODEL_FALLBACK`, `LLM_BASE_URL`, `LLM_TIMEOUT`, `LLM_MAX_RETRIES`, `LLM_DEADLINE`, `LLM_CACHE_SIZE` | optional tuning |
+| `OPENROUTER_API_KEY`, `LLM_MODEL` | required for optimization |
+| `LLM_REASONING`, `LLM_TIMEOUT`, `LLM_MAX_RETRIES`, `LLM_DEADLINE`, `LLM_CACHE_SIZE`, `LLM_BASE_URL` | optional tuning |
 
 **No authentication is required on the judging path.** `/health` and
 `/optimize-energy` are `AllowAny`, have no SessionAuthentication, and are
@@ -366,8 +361,9 @@ docker build -t gridwise-web:latest .
 docker run --rm -p 8000:8000 \
   -e SECRET_KEY=change-me \
   -e SECURE_SSL_REDIRECT=False \
-  -e LLM_PROVIDER=gemini -e LLM_MODEL=gemini-3.6-flash \
-  -e LLM_API_KEY=<your-key> \
+  -e OPENROUTER_API_KEY=<your-key> \
+  -e LLM_MODEL=deepseek/deepseek-v4.1-flash \
+  -e LLM_REASONING=off \
   gridwise-web:latest
 
 curl -s https://gridwiseoptimizer-a38603e4c359.herokuapp.com/health      # {"status": "ok"}
@@ -392,7 +388,7 @@ docker compose --profile postgres up --build    # web + Postgres
 - [PuLP](https://coin-or.github.io/pulp/) with the
   [CBC](https://github.com/coin-or/Cbc) solver — the linear program
 - [openai](https://github.com/openai/openai-python) — OpenAI-compatible client
-  (used for Gemini and OpenAI)
+  (OpenRouter Chat Completions)
 - [django-environ](https://django-environ.readthedocs.io/) — env-based settings
 - [Uvicorn](https://www.uvicorn.org/) — ASGI server
 - [psycopg](https://www.psycopg.org/) — PostgreSQL driver
@@ -402,9 +398,8 @@ docker compose --profile postgres up --build    # web + Postgres
 
 ## Known limitations
 
-- **LLM availability**: interpretation depends on the configured provider. On a
-  timeout or provider error (e.g. a transient `503`) the request returns a
-  controlled `500`; the fallback model mitigates but does not eliminate this.
+- **LLM availability**: interpretation depends on OpenRouter. Retries and key
+  rotation absorb transient errors; persistent failure yields a controlled `500`.
 - **CBC architecture**: PuLP's bundled CBC is x86-64; native Apple Silicon needs
   `brew install cbc` (auto-detected). The Linux deploy image runs the bundled
   solver.
