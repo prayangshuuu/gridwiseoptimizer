@@ -1,4 +1,4 @@
-"""Orchestrates primary (Gemini) and fallback (OpenRouter) LLM interpretation."""
+"""Orchestrates OpenRouter LLM interpretation (with an optional secondary)."""
 from __future__ import annotations
 
 import collections
@@ -17,6 +17,15 @@ from .llm_providers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_provider(name: str) -> LLMProvider | None:
+    """Construct an LLM provider by name, or None when unknown/disabled."""
+    if name in ("openrouter", "open_router"):
+        return build_openrouter_provider()
+    if name in ("gemini", "google"):
+        return build_gemini_provider()
+    return None
 
 _CACHE: "collections.OrderedDict[str, list]" = collections.OrderedDict()
 _CACHE_LOCK = threading.Lock()
@@ -79,7 +88,8 @@ class InterpretationResult:
 
 
 class DirectiveInterpreter:
-    """Try Gemini first; on provider failure, try OpenRouter once."""
+    """Try the primary provider (OpenRouter by default); on failure, try the
+    optional secondary once."""
 
     def __init__(
         self,
@@ -94,15 +104,11 @@ class DirectiveInterpreter:
 
     @classmethod
     def from_env(cls) -> DirectiveInterpreter:
-        primary_name = (_env("LLM_PRIMARY_PROVIDER") or _env("LLM_PROVIDER") or "gemini").lower()
-        fallback_name = (_env("LLM_FALLBACK_PROVIDER") or "openrouter").lower()
+        primary_name = (_env("LLM_PRIMARY_PROVIDER") or _env("LLM_PROVIDER") or "openrouter").lower()
+        fallback_name = (_env("LLM_FALLBACK_PROVIDER") or "").lower()
 
-        primary = build_gemini_provider() if primary_name in ("gemini", "google") else None
-        fallback = (
-            build_openrouter_provider()
-            if fallback_name in ("openrouter", "open_router")
-            else None
-        )
+        primary = _build_provider(primary_name)
+        fallback = _build_provider(fallback_name) if fallback_name else None
         try:
             cache_size = int(float(_env("LLM_CACHE_SIZE", "256") or 256))
         except (TypeError, ValueError):
