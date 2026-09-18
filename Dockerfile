@@ -22,7 +22,7 @@ COPY . /app/
 RUN uv sync --frozen
 
 # Ensure the entrypoint is executable and dirs exist
-RUN chmod +x /app/docker-entrypoint.sh \
+RUN chmod +x /app/docker-entrypoint.sh /app/scripts/heroku-release.sh \
     && mkdir -p /app/staticfiles /app/media \
     && chown -R appuser:appuser /app
 

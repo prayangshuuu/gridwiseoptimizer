@@ -4,6 +4,4 @@ build:
 release:
   image: web
   command:
-    - /bin/sh
-    - -c
-    - uv run python manage.py migrate && uv run python manage.py seed
+    - /app/scripts/heroku-release.sh
