@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block title %}Home{% endblock %}
+
+{% block content %}
+    {% if user.is_authenticated %}
+        {{ user.email|default:user.username }}
+    {% endif %}
+{% endblock %}

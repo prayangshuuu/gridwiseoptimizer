@@ -1,0 +1,7 @@
+build:
+  docker:
+    web: Dockerfile
+release:
+  image: web
+  command:
+    - sh -c "uv run python manage.py migrate && uv run python manage.py seed"
