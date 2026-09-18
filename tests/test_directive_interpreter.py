@@ -68,8 +68,15 @@ class TestDirectiveInterpreter(unittest.TestCase):
     def setUp(self):
         clear_cache()
         reset_interpreter_for_tests(DirectiveInterpreter.from_env())
+        self._saved_log_levels = {}
+        for name in ("gridwise.directive_interpreter", "gridwise.llm_providers"):
+            log = logging.getLogger(name)
+            self._saved_log_levels[name] = log.level
+            log.setLevel(logging.CRITICAL)
 
     def tearDown(self):
+        for name, level in self._saved_log_levels.items():
+            logging.getLogger(name).setLevel(level)
         clear_cache()
         reset_interpreter_for_tests(DirectiveInterpreter.from_env())
 
@@ -212,6 +219,7 @@ class TestDirectiveInterpreter(unittest.TestCase):
         primary = RecordingProvider(error=LLMError(f"failed with {secret}"), label="gemini")
         fallback = RecordingProvider(error=LLMError("backup down"), label="openrouter")
         with self.assertLogs("gridwise.directive_interpreter", level="WARNING") as captured:
+            logging.getLogger("gridwise.directive_interpreter").setLevel(logging.WARNING)
             with self.assertRaises(LLMError):
                 DirectiveInterpreter(primary=primary, fallback=fallback).interpret(["x"])
         blob = " ".join(r.getMessage() for r in captured.records)

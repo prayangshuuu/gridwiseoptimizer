@@ -113,12 +113,17 @@ def _extract_number(text: str, unit_pattern: str) -> float | None:
 
 
 def _is_target(low: str, span_start: int) -> bool:
-    """True when the number at span_start is a TARGET level ("scale to 70%")
-    rather than an amount to remove ("cut by 30%"). Only "to/at/reach/of/=" in
-    the few characters immediately before the number count — this avoids the
-    "to" inside a time range ("noon to 4pm") flipping the meaning."""
-    prefix = low[max(0, span_start - 12):span_start]
-    return bool(re.search(r"\b(to|at|reach|of|=)\b[^0-9]{0,8}$", prefix))
+    """True when the number at span_start is a TARGET level ("scale to 70%",
+    "treated as 25%") rather than an amount to remove ("cut by 30%"). Only
+    "to/at/reach/of/=/as" in the few characters immediately before the number
+    count — this avoids the "to" inside a time range ("noon to 4pm") flipping
+    the meaning."""
+    prefix = low[max(0, span_start - 16):span_start]
+    return bool(re.search(
+        r"\b(to|at|reach|of|=|as|down to|set to|leave|usable|treated|"
+        r"of the forecast|of the predicted|of the expected)\b[^0-9]{0,10}$",
+        prefix,
+    ))
 
 
 def _solar_factor(text: str) -> float:

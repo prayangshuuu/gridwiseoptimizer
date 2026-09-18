@@ -170,7 +170,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
 
         # Any failure past this point is a controlled 500. Never leak internals.
         try:
-            response_body, fallback_used = self._run_pipeline(validated)
+            response_body, fallback_used, llm_provider = self._run_pipeline(validated)
         except Exception as exc:  # noqa: BLE001 - deliberately catch-all + safe
             logger.exception("optimize-energy pipeline failed: %s", type(exc).__name__)
             _log_event(scenario_id=scenario_id, path=path, status=500,
@@ -189,7 +189,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
                    llm_provider=llm_provider if not fallback_used else "deterministic")
         return Response(response_body, status=status.HTTP_200_OK)
 
-    def _run_pipeline(self, validated: dict) -> tuple[dict, bool]:
+    def _run_pipeline(self, validated: dict) -> tuple[dict, bool, str | None]:
         notes = validated["operator_notes"]
         hours = validated["hours"]
         battery = validated["battery"]
@@ -203,7 +203,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
             llm_provider = get_last_provider_used()
         except LLMError as exc:
             logger.warning("LLM interpretation failed; using fallback: %s", exc)
-            raw = interpret_notes_fallback(notes)
+            raw = interpret_notes_fallback(notes, battery=battery)
             fallback_used = True
             llm_provider = None
 
@@ -233,7 +233,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
             "plan_summary": self._summary(
                 plan, total_grid_kwh, total_cost_bdt, peak
             ),
-        }, fallback_used
+        }, fallback_used, llm_provider
 
     @staticmethod
     def _summary(plan, total_grid_kwh, total_cost_bdt, peak) -> str:
