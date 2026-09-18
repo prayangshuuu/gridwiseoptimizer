@@ -328,6 +328,12 @@ def main() -> int:
     ap.add_argument("--url", default=DEFAULT_URL, help="Base URL of the running server")
     args = ap.parse_args()
 
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from gridwise.llm_env import load_dotenv
+
+    load_dotenv()
+
     try:
         path = find_cases_file(args.file)
         cases = load_cases(path)

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Paraphrase-robustness checker for the interpretation layer.
 
-Runs ``interpret_notes`` (the real LLM path) -> ``validate_directives`` over
-tests/paraphrase_cases.json and checks each result against the expected
-directive on structure only: directive_type + hours + numeric values. Free-text
-explanations are ignored. Prints a per-case PASS/FAIL table and per-directive
-accuracy so prompt regressions are easy to spot.
+Runs ``interpret_notes`` (OpenRouter via ``OPENROUTER_API_KEY``) ->
+``validate_directives`` over tests/paraphrase_cases.json and checks each result
+against the expected directive on structure only: directive_type + hours + numeric
+values. Free-text explanations are ignored.
 
 Usage:
     uv run scripts/interp_check.py
@@ -14,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -23,21 +21,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 LARGE_CAPACITY = 1e9  # so reserve bounds never coerce a test directive
-
-
-def _load_dotenv() -> None:
-    """Best-effort: load repo .env into os.environ (does not overwrite)."""
-    env = ROOT / ".env"
-    if not env.is_file():
-        return
-    for line in env.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = val
 
 
 def _sig(directive_type, hours, factor=None, minimum_energy_kwh=None, max_grid_kwh=None):
@@ -68,16 +51,15 @@ def main() -> int:
                          "free tiers, e.g. --delay 5).")
     args = ap.parse_args()
 
-    _load_dotenv()
+    from gridwise.llm_env import load_dotenv
+
+    load_dotenv()
 
     import json
     import time
     from gridwise.llm import interpret_notes, LLMError, clear_cache
-    from gridwise.fallback import interpret_notes_fallback
     from gridwise.guardrails import validate_directives
 
-    # A battery with effectively unbounded capacity so reserve bounds never
-    # coerce a test directive; guardrails reads .capacity_kwh / ["capacity"].
     battery = {"capacity_kwh": LARGE_CAPACITY, "capacity": LARGE_CAPACITY}
 
     path = Path(args.file)
@@ -102,17 +84,11 @@ def main() -> int:
         name = case.get("name", "?")
         notes = case["notes"]
         expected = case["expected"]
-        detail = "ok"
         try:
-            raw = interpret_notes(notes)
-            path_used = "llm"
+            raw = interpret_notes(notes, battery=battery)
         except LLMError as e:
-            # LLM unavailable (rate-limited / provider error). Mirror the
-            # production behavior in gridwise.views: fall back to the
-            # deterministic interpreter instead of reporting a hard failure.
-            print(f"  [fallback: {type(e).__name__}: {str(e)[:50]}]", file=sys.stderr)
-            raw = interpret_notes_fallback(notes, battery=battery)
-            path_used = "fallback"
+            print(f"{name.ljust(name_w)}  FAIL    LLM: {type(e).__name__}: {str(e)[:80]}")
+            continue
 
         directives = validate_directives(raw, num_notes=len(notes),
                                          battery=battery)

@@ -1,14 +1,14 @@
-"""Orchestrates LLM interpretation. OpenRouter is the one and only provider."""
+"""Orchestrates LLM interpretation via OpenRouter (single provider)."""
 from __future__ import annotations
 
 import collections
 import copy
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass
 
+from .llm_env import getenv, llm_timeout_seconds, load_dotenv
 from .llm_errors import LLMError
 from .llm_providers import LLMProvider, build_openrouter_provider
 
@@ -18,32 +18,6 @@ _CACHE: "collections.OrderedDict[str, list]" = collections.OrderedDict()
 _CACHE_LOCK = threading.Lock()
 _LAST_PROVIDER_USED: str | None = None
 _LAST_PROVIDER_LOCK = threading.Lock()
-
-
-def _env(name: str, default: str | None = None) -> str | None:
-    val = os.environ.get(name, default)
-    return val.strip() if isinstance(val, str) else val
-
-
-def _timeout_seconds() -> float | None:
-    """Per-request timeout in seconds, or None for "never expire".
-
-    ``LLM_TIMEOUT``/``LLM_TIMEOUT_SECONDS`` set to 0, blank, ``none`` or ``off``
-    disables the client-side clock so a slow free-tier model can run to
-    completion instead of raising APITimeoutError and dropping to the
-    deterministic fallback."""
-    for name in ("LLM_TIMEOUT_SECONDS", "LLM_TIMEOUT"):
-        raw = _env(name)
-        if raw is None:
-            continue
-        raw = raw.lower()
-        if raw in ("", "0", "none", "off", "inf"):
-            return None
-        try:
-            return max(0.1, float(raw))
-        except ValueError:
-            pass
-    return None
 
 
 def _cache_get(key: str):
@@ -85,32 +59,25 @@ class InterpretationResult:
 
 
 class DirectiveInterpreter:
-    """Interpret operator notes via OpenRouter — the one and only provider.
-
-    A ``fallback`` slot remains only so tests can inject a stub; the production
-    path built by :meth:`from_env` never wires a second provider."""
+    """Interpret operator notes via OpenRouter."""
 
     def __init__(
         self,
-        primary: LLMProvider | None = None,
-        fallback: LLMProvider | None = None,
+        provider: LLMProvider | None = None,
         *,
         cache_size: int = 256,
     ) -> None:
-        self._primary = primary
-        self._fallback = fallback
+        self._provider = provider
         self._cache_size = max(1, cache_size)
 
     @classmethod
     def from_env(cls) -> DirectiveInterpreter:
-        # OpenRouter is the sole provider (project requirement). Provider-
-        # selection env vars are intentionally ignored so nothing else is used.
-        primary = build_openrouter_provider()
+        load_dotenv()
         try:
-            cache_size = int(float(_env("LLM_CACHE_SIZE", "256") or 256))
+            cache_size = int(float(getenv("LLM_CACHE_SIZE", "256") or 256))
         except (TypeError, ValueError):
             cache_size = 256
-        return cls(primary=primary, fallback=None, cache_size=cache_size)
+        return cls(provider=build_openrouter_provider(), cache_size=cache_size)
 
     def interpret(
         self,
@@ -133,37 +100,12 @@ class DirectiveInterpreter:
             provider = get_last_provider_used() or "cache"
             return InterpretationResult(cached, provider)
 
-        timeout = _timeout_seconds()
-        last_error: LLMError | None = None
+        if self._provider is None:
+            raise LLMError("No LLM provider configured.")
 
-        if self._primary is not None:
-            try:
-                results = self._primary.interpret(notes, timeout, battery=battery)
-                _cache_put(cache_key, results, self._cache_size)
-                _set_last_provider_used(self._primary.name)
-                logger.info("directive_interpretation provider_used=%s", self._primary.name)
-                return InterpretationResult(results, self._primary.name)
-            except LLMError as exc:
-                last_error = exc
-                logger.warning(
-                    "Primary LLM provider (%s) failed: %s",
-                    self._primary.name,
-                    type(exc).__name__,
-                )
-
-        if self._fallback is not None:
-            try:
-                results = self._fallback.interpret(notes, timeout, battery=battery)
-                _cache_put(cache_key, results, self._cache_size)
-                _set_last_provider_used(self._fallback.name)
-                logger.info("directive_interpretation provider_used=%s", self._fallback.name)
-                return InterpretationResult(results, self._fallback.name)
-            except LLMError as exc:
-                last_error = exc
-                logger.warning(
-                    "Fallback LLM provider (%s) failed: %s",
-                    self._fallback.name,
-                    type(exc).__name__,
-                )
-
-        raise last_error or LLMError("All LLM providers failed.")
+        timeout = llm_timeout_seconds()
+        results = self._provider.interpret(notes, timeout, battery=battery)
+        _cache_put(cache_key, results, self._cache_size)
+        _set_last_provider_used(self._provider.name)
+        logger.info("directive_interpretation provider_used=%s", self._provider.name)
+        return InterpretationResult(results, self._provider.name)

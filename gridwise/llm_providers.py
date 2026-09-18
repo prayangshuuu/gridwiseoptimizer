@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Sequence
@@ -12,25 +11,21 @@ from .llm_contract import (
     parse_provider_content,
     validate_interpretation_schema,
 )
+from .llm_env import (
+    getenv,
+    openrouter_api_keys,
+    openrouter_base_url,
+    openrouter_model,
+)
 from .llm_errors import LLMError
 
 logger = logging.getLogger(__name__)
 
 ProviderClientFactory = Callable[[str, str | None, float], object]
 
-_PROVIDER_BASE_URLS = {
-    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
-    "google": "https://generativelanguage.googleapis.com/v1beta/openai/",
-    "openrouter": "https://openrouter.ai/api/v1",
-}
-
-# Project requirement: OpenRouter + this model only (env overrides are ignored).
-OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash"
-
 
 def _env(name: str, default: str | None = None) -> str | None:
-    val = os.environ.get(name, default)
-    return val.strip() if isinstance(val, str) else val
+    return getenv(name, default)
 
 
 def _llm_error(msg: str, *, transient: bool = False, auth_failure: bool = False) -> LLMError:
@@ -56,7 +51,7 @@ def _retry_config() -> tuple[int, float, float | None]:
 
     ``LLM_DEADLINE`` of 0/blank/none means "no overall deadline" — combined
     with a disabled ``LLM_TIMEOUT`` this lets a slow free-tier model run to
-    completion instead of expiring into the deterministic fallback."""
+    completion instead of failing early on slow free-tier models."""
     max_retries = max(0, int(_num_env("LLM_MAX_RETRIES", 3)))
     backoff = max(0.0, _num_env("LLM_RETRY_BACKOFF", 0.5))
     raw_deadline = (_env("LLM_DEADLINE") or "").lower()
@@ -147,37 +142,6 @@ def _should_rotate_api_key(exc, openai_pkg) -> bool:
     return status == 429
 
 
-def gemini_api_key_candidates() -> list[str]:
-    seen: set[str] = set()
-    keys: list[str] = []
-    for name in ("LLM_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        raw = _env(name)
-        if not raw:
-            continue
-        for part in raw.split(","):
-            part = part.strip()
-            if part and part not in seen:
-                seen.add(part)
-                keys.append(part)
-    studio = [k for k in keys if k.startswith("AIzaSy")]
-    return studio if studio else keys
-
-
-def openrouter_api_key_candidates() -> list[str]:
-    seen: set[str] = set()
-    keys: list[str] = []
-    for name in ("OPENROUTER_API_KEY", "LLM_FALLBACK_API_KEY"):
-        raw = _env(name)
-        if not raw:
-            continue
-        for part in raw.split(","):
-            part = part.strip()
-            if part and part not in seen:
-                seen.add(part)
-                keys.append(part)
-    return keys
-
-
 class LLMProvider(ABC):
     """Provider adapter that returns schema-validated directive payloads."""
 
@@ -194,7 +158,7 @@ class LLMProvider(ABC):
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    """Gemini / OpenRouter via the OpenAI chat completions API."""
+    """OpenRouter via the OpenAI chat completions API."""
 
     def __init__(
         self,
@@ -334,28 +298,8 @@ class OpenAICompatibleProvider(LLMProvider):
         raise last_error or _llm_error(f"Provider {self.name} failed with no error captured.")
 
 
-class GeminiProvider(OpenAICompatibleProvider):
-    """Primary Google Gemini provider."""
-
-
 class OpenRouterProvider(OpenAICompatibleProvider):
-    """The sole LLM provider: DeepSeek via OpenRouter."""
-
-
-def build_gemini_provider(
-    *,
-    model: str | None = None,
-    client_factory: ProviderClientFactory | None = None,
-) -> GeminiProvider:
-    provider_model = model or _env("LLM_PRIMARY_MODEL") or _env("LLM_MODEL")
-    base = _env("LLM_BASE_URL") or _PROVIDER_BASE_URLS["gemini"]
-    return GeminiProvider(
-        name="gemini",
-        model=provider_model or "",
-        api_keys=gemini_api_key_candidates(),
-        base_url=base,
-        client_factory=client_factory,
-    )
+    """OpenRouter (DeepSeek) — the only LLM provider."""
 
 
 def build_openrouter_provider(
@@ -363,13 +307,10 @@ def build_openrouter_provider(
     model: str | None = None,
     client_factory: ProviderClientFactory | None = None,
 ) -> OpenRouterProvider:
-    # Tests may inject ``model``; production always uses OPENROUTER_MODEL.
-    provider_model = model or OPENROUTER_MODEL
-    base = _env("LLM_FALLBACK_BASE_URL") or _PROVIDER_BASE_URLS["openrouter"]
     return OpenRouterProvider(
         name="openrouter",
-        model=provider_model,
-        api_keys=openrouter_api_key_candidates(),
-        base_url=base,
+        model=model or openrouter_model(),
+        api_keys=openrouter_api_keys(),
+        base_url=openrouter_base_url(),
         client_factory=client_factory,
     )

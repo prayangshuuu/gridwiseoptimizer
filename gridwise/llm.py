@@ -1,8 +1,9 @@
-"""Mandatory LLM interpretation layer (OpenRouter → DeepSeek v4.1 flash only).
+"""Mandatory LLM interpretation layer (OpenRouter only).
 
 ``interpret_notes`` turns free-text operator notes into structured directives.
-The model and provider are fixed; API keys come from environment variables.
-Validated JSON is returned for guardrails; never trust it for scheduling directly.
+Configuration is read exclusively from ``gridwise.llm_env`` (``OPENROUTER_API_KEY``,
+optional ``LLM_MODEL`` / ``LLM_BASE_URL`` / timeout vars). Validated JSON is
+returned for guardrails; never trust it for scheduling directly.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from .directive_interpreter import (
     clear_cache,
     get_last_provider_used,
 )
+from .llm_env import load_dotenv
 from .llm_contract import (
     DIRECTIVE_TYPES,
     FEWSHOT_ASSISTANT,
@@ -28,6 +30,7 @@ _default_interpreter: DirectiveInterpreter | None = None
 def _interpreter() -> DirectiveInterpreter:
     global _default_interpreter
     if _default_interpreter is None:
+        load_dotenv()
         _default_interpreter = DirectiveInterpreter.from_env()
     return _default_interpreter
 
@@ -55,6 +58,7 @@ __all__ = [
     "clear_cache",
     "get_last_provider_used",
     "interpret_notes",
+    "load_dotenv",
     "reset_interpreter_for_tests",
     "validate_interpretation_schema",
 ]

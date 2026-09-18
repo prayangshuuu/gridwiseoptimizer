@@ -12,7 +12,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .serializers import OptimizeEnergyRequestSerializer, OptimizeEnergyResponseSerializer
 from .llm import interpret_notes, LLMError, get_last_provider_used
-from .fallback import interpret_notes_fallback, reconcile_with_fallback
+from .llm_contract import align_minimum_reserves_from_notes
 from .guardrails import validate_directives, to_interpretation
 from .optimizer import optimize, OptimizerError
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
@@ -27,7 +27,7 @@ def _ms(started: float) -> int:
 
 def _log_event(**fields) -> None:
     """Emit one structured log line. Only safe metadata is ever included here
-    (scenario_id, path, status, latency_ms, fallback_used) — never API keys,
+    (scenario_id, path, status, latency_ms, llm_provider) — never API keys,
     prompt text, or full request/response bodies."""
     try:
         logger.info("optimize_energy %s", json.dumps(fields, sort_keys=True))
@@ -69,16 +69,11 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
     hourly plan so the numbers are internally consistent and independently
     replayable.
 
-    Reliability: if the LLM path fails (timeout/flaky provider -> LLMError), a
-    deterministic keyword interpreter (gridwise.fallback) is used so the request
-    still yields a valid schedule (fallback_used=true). Only a deeper failure
-    (guardrails/optimizer/unexpected) becomes a controlled 500.
-
     Status codes:
       - 400 if the request body is not valid JSON.
       - 422 if the JSON is well-formed but fails validation.
-      - 500 (controlled, no stack trace/secrets) on any pipeline failure.
-      - 200 with the plan otherwise (possibly via the deterministic fallback).
+      - 500 (controlled, no stack trace/secrets) on LLM or optimizer failure.
+      - 200 with the plan when interpretation and optimization succeed.
     """
 
     @extend_schema(
@@ -150,7 +145,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
             data = request.data
         except ParseError as exc:
             _log_event(path=path, status=400, latency_ms=_ms(started),
-                       fallback_used=False, error="malformed_json")
+                       error="malformed_json")
             return Response(
                 {"detail": "Malformed JSON.", "error": str(exc.detail)},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -160,7 +155,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
         serializer = OptimizeEnergyRequestSerializer(data=data)
         if not serializer.is_valid():
             _log_event(path=path, status=422, latency_ms=_ms(started),
-                       fallback_used=False, error="validation_failed")
+                       error="validation_failed")
             return Response(
                 {"detail": "Validation failed.", "errors": serializer.errors},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -170,12 +165,11 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
 
         # Any failure past this point is a controlled 500. Never leak internals.
         try:
-            response_body, fallback_used, llm_provider = self._run_pipeline(validated)
+            response_body, llm_provider = self._run_pipeline(validated)
         except Exception as exc:  # noqa: BLE001 - deliberately catch-all + safe
             logger.exception("optimize-energy pipeline failed: %s", type(exc).__name__)
             _log_event(scenario_id=scenario_id, path=path, status=500,
-                       latency_ms=_ms(started), fallback_used=False,
-                       error=type(exc).__name__)
+                       latency_ms=_ms(started), error=type(exc).__name__)
             return Response(
                 {"detail": "Failed to optimize the scenario."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -185,28 +179,18 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
         self._log_run(validated, response_body)
 
         _log_event(scenario_id=scenario_id, path=path, status=200,
-                   latency_ms=_ms(started), fallback_used=fallback_used,
-                   llm_provider=llm_provider if not fallback_used else "deterministic")
+                   latency_ms=_ms(started),
+                   llm_provider=llm_provider)
         return Response(response_body, status=status.HTTP_200_OK)
 
-    def _run_pipeline(self, validated: dict) -> tuple[dict, bool, str | None]:
+    def _run_pipeline(self, validated: dict) -> tuple[dict, str | None]:
         notes = validated["operator_notes"]
         hours = validated["hours"]
         battery = validated["battery"]
 
-        # LLM stays the primary path; the deterministic interpreter is the
-        # safety net used ONLY when the LLM call finally fails.
-        fallback_used = False
-        llm_provider = None
-        try:
-            raw = interpret_notes(notes, battery=battery)
-            raw = reconcile_with_fallback(raw, notes, battery=battery)
-            llm_provider = get_last_provider_used()
-        except LLMError as exc:
-            logger.warning("LLM interpretation failed; using fallback: %s", exc)
-            raw = interpret_notes_fallback(notes, battery=battery)
-            fallback_used = True
-            llm_provider = None
+        raw = interpret_notes(notes, battery=battery)
+        raw = align_minimum_reserves_from_notes(raw, notes, battery)
+        llm_provider = get_last_provider_used()
 
         directives = validate_directives(
             raw, num_notes=len(notes), battery=battery
@@ -234,7 +218,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
             "plan_summary": self._summary(
                 plan, total_grid_kwh, total_cost_bdt, peak
             ),
-        }, fallback_used, llm_provider
+        }, llm_provider
 
     @staticmethod
     def _summary(plan, total_grid_kwh, total_cost_bdt, peak) -> str:

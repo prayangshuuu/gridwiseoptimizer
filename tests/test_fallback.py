@@ -1,5 +1,5 @@
 import unittest
-from gridwise.fallback import interpret_notes_fallback, reconcile_with_fallback
+from gridwise.fallback import interpret_notes_fallback
 
 class TestFallback(unittest.TestCase):
     def test_solar_reduction(self):
@@ -81,28 +81,6 @@ class TestFallback(unittest.TestCase):
         self.assertEqual(results[0]["directive_type"], "minimum_battery_reserve")
         self.assertEqual(results[0]["structured_adjustment"]["hours"], [0, 1, 2, 3, 4])
         self.assertEqual(results[0]["structured_adjustment"]["minimum_energy_kwh"], 20.0)
-
-    def test_reconcile_fixes_llm_zero_reserve(self):
-        note = (
-            "Keep at least 50% of the battery capacity stored in the battery "
-            "from 6 PM until 9 PM for emergency operations."
-        )
-        battery = {"capacity_kwh": 200, "minimum_energy_kwh": 40}
-        llm_raw = [{
-            "note_index": 0,
-            "applies": True,
-            "directive_type": "minimum_battery_reserve",
-            "structured_adjustment": {
-                "hours": [18, 19, 20],
-                "minimum_energy_kwh": 0.0,
-            },
-            "explanation": "LLM botched the kWh conversion.",
-        }]
-        fixed = reconcile_with_fallback(llm_raw, [note], battery=battery)
-        self.assertEqual(
-            fixed[0]["structured_adjustment"]["minimum_energy_kwh"],
-            100.0,
-        )
 
     def test_distractor(self):
         notes = [

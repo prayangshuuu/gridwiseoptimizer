@@ -136,6 +136,62 @@ def _battery_capacity_kwh(battery: Any) -> float | None:
     return None
 
 
+def _reserve_kwh_from_note(note: str, capacity_kwh: float | None) -> float | None:
+    """Absolute kWh implied by explicit units or ``N% of … capacity`` in the note."""
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:kwh|kw|kilowatt(?:-?hours?)?)",
+        note,
+        re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1))
+    if capacity_kwh and capacity_kwh > 0:
+        pct = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:%|percent)\s*(?:of\s*(?:the\s*)?"
+            r"(?:battery|capacity|pack))?",
+            note,
+            re.IGNORECASE,
+        )
+        if pct:
+            return round(capacity_kwh * float(pct.group(1)) / 100.0, 6)
+    return None
+
+
+def align_minimum_reserves_from_notes(
+    results: list[dict],
+    operator_notes: list[str],
+    battery: Any,
+) -> list[dict]:
+    """Raise under-specified ``minimum_energy_kwh`` when the note implies more."""
+    cap = _battery_capacity_kwh(battery)
+    if cap is None:
+        return results
+    aligned: list[dict] = []
+    for i, entry in enumerate(results):
+        if not isinstance(entry, dict):
+            aligned.append(entry)
+            continue
+        if entry.get("directive_type") != "minimum_battery_reserve" or not entry.get("applies"):
+            aligned.append(entry)
+            continue
+        note = operator_notes[i] if i < len(operator_notes) else ""
+        implied = _reserve_kwh_from_note(str(note), cap)
+        if implied is None:
+            aligned.append(entry)
+            continue
+        adj = dict(entry.get("structured_adjustment") or {})
+        try:
+            current = float(adj.get("minimum_energy_kwh", 0))
+        except (TypeError, ValueError):
+            current = 0.0
+        if implied > current:
+            adj["minimum_energy_kwh"] = implied
+            aligned.append({**entry, "structured_adjustment": adj})
+        else:
+            aligned.append(entry)
+    return aligned
+
+
 def build_chat_messages(
     operator_notes: list[str],
     *,
