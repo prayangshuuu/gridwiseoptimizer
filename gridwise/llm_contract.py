@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from .llm_errors import LLMError
@@ -50,6 +51,9 @@ Rules:
         or "by 0.3" -> 0.7; "by half" -> 0.5; "to 70%" -> 0.7; "no solar"/"off"
         -> 0. Never emit a factor above 1.
       minimum_battery_reserve: {{"hours": [...], "minimum_energy_kwh": <kWh >= 0>}}
+        Always emit absolute kWh, never a percentage. When the request includes
+        battery.capacity_kwh, convert "N% of (the) battery capacity" to
+        minimum_energy_kwh = capacity_kwh * N / 100.
       no_charge_window:        {{"hours": [...]}}
       no_discharge_window:     {{"hours": [...]}}
       max_grid_window:         {{"hours": [...], "max_grid_kwh": <kWh >= 0>}}
@@ -112,15 +116,43 @@ FEWSHOT_ASSISTANT = json.dumps({
 })
 
 
-def build_chat_messages(operator_notes: list[str]) -> list[dict[str, str]]:
+def _battery_capacity_kwh(battery: Any) -> float | None:
+    """Capacity in kWh for prompt context (mirrors guardrails field aliases)."""
+    if battery is None:
+        return None
+    getters = (
+        lambda b: getattr(b, "capacity_kwh", None),
+        lambda b: getattr(b, "capacity", None),
+        lambda b: b.get("capacity_kwh") if isinstance(b, dict) else None,
+        lambda b: b.get("capacity") if isinstance(b, dict) else None,
+    )
+    for getter in getters:
+        try:
+            val = getter(battery)
+        except (AttributeError, KeyError, TypeError):
+            continue
+        if _is_finite_number(val) and float(val) > 0:
+            return float(val)
+    return None
+
+
+def build_chat_messages(
+    operator_notes: list[str],
+    *,
+    battery: Any = None,
+) -> list[dict[str, str]]:
     """Messages shared by every LLM provider."""
+    payload: dict[str, Any] = {"operator_notes": operator_notes}
+    cap = _battery_capacity_kwh(battery)
+    if cap is not None:
+        payload["battery"] = {"capacity_kwh": cap}
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": FEWSHOT_USER},
         {"role": "assistant", "content": FEWSHOT_ASSISTANT},
         {
             "role": "user",
-            "content": json.dumps({"operator_notes": operator_notes}),
+            "content": json.dumps(payload),
         },
     ]
 
@@ -233,14 +265,43 @@ def _validate_entry(entry: Any, note_index: int) -> dict:
     }
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _loads_lenient(content: str):
+    """json.loads, tolerating models that wrap JSON in prose or ```json fences.
+
+    Some OpenRouter models ignore ``response_format=json_object`` and return the
+    object inside a markdown fence or after a preamble. We try the raw string,
+    then any fenced block, then the first balanced {...}/[...] span."""
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    for candidate in _FENCE_RE.findall(content):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = content.find(opener)
+        end = content.rfind(closer)
+        if 0 <= start < end:
+            try:
+                return json.loads(content[start:end + 1])
+            except json.JSONDecodeError:
+                continue
+
+    raise LLMError("LLM response was not valid JSON.")
+
+
 def parse_provider_content(content: str, num_notes: int) -> list[dict]:
     """Parse JSON content from a provider; raise LLMError on transport-level issues."""
     if not content:
         raise LLMError("LLM returned an empty response.")
-    try:
-        parsed = json.loads(content)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise LLMError("LLM response was not valid JSON.") from exc
+    parsed = _loads_lenient(content)
 
     raw = parsed["results"] if isinstance(parsed, dict) and "results" in parsed else parsed
     if not isinstance(raw, list):

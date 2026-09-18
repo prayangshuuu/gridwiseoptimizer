@@ -1,7 +1,7 @@
-"""Mandatory LLM interpretation layer (Gemini primary, OpenRouter fallback).
+"""Mandatory LLM interpretation layer (OpenRouter → DeepSeek v4.1 flash only).
 
 ``interpret_notes`` turns free-text operator notes into structured directives.
-Provider selection, models, and API keys come from environment variables only.
+The model and provider are fixed; API keys come from environment variables.
 Validated JSON is returned for guardrails; never trust it for scheduling directly.
 """
 from __future__ import annotations
@@ -38,9 +38,9 @@ def reset_interpreter_for_tests(interpreter: DirectiveInterpreter | None = None)
     _default_interpreter = interpreter or DirectiveInterpreter.from_env()
 
 
-def interpret_notes(operator_notes):
-    """Interpret operator notes via Gemini, then OpenRouter on provider failure."""
-    result = _interpreter().interpret(list(operator_notes))
+def interpret_notes(operator_notes, battery=None):
+    """Interpret operator notes via OpenRouter (DeepSeek v4.1 flash)."""
+    result = _interpreter().interpret(list(operator_notes), battery=battery)
     return result.results
 
 

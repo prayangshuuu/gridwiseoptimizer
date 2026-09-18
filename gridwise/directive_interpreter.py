@@ -1,4 +1,4 @@
-"""Orchestrates OpenRouter LLM interpretation (with an optional secondary)."""
+"""Orchestrates LLM interpretation. OpenRouter is the one and only provider."""
 from __future__ import annotations
 
 import collections
@@ -10,22 +10,9 @@ import threading
 from dataclasses import dataclass
 
 from .llm_errors import LLMError
-from .llm_providers import (
-    LLMProvider,
-    build_gemini_provider,
-    build_openrouter_provider,
-)
+from .llm_providers import LLMProvider, build_openrouter_provider
 
 logger = logging.getLogger(__name__)
-
-
-def _build_provider(name: str) -> LLMProvider | None:
-    """Construct an LLM provider by name, or None when unknown/disabled."""
-    if name in ("openrouter", "open_router"):
-        return build_openrouter_provider()
-    if name in ("gemini", "google"):
-        return build_gemini_provider()
-    return None
 
 _CACHE: "collections.OrderedDict[str, list]" = collections.OrderedDict()
 _CACHE_LOCK = threading.Lock()
@@ -38,15 +25,25 @@ def _env(name: str, default: str | None = None) -> str | None:
     return val.strip() if isinstance(val, str) else val
 
 
-def _timeout_seconds() -> float:
+def _timeout_seconds() -> float | None:
+    """Per-request timeout in seconds, or None for "never expire".
+
+    ``LLM_TIMEOUT``/``LLM_TIMEOUT_SECONDS`` set to 0, blank, ``none`` or ``off``
+    disables the client-side clock so a slow free-tier model can run to
+    completion instead of raising APITimeoutError and dropping to the
+    deterministic fallback."""
     for name in ("LLM_TIMEOUT_SECONDS", "LLM_TIMEOUT"):
         raw = _env(name)
-        if raw:
-            try:
-                return max(0.1, float(raw))
-            except ValueError:
-                pass
-    return 10.0
+        if raw is None:
+            continue
+        raw = raw.lower()
+        if raw in ("", "0", "none", "off", "inf"):
+            return None
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            pass
+    return None
 
 
 def _cache_get(key: str):
@@ -88,8 +85,10 @@ class InterpretationResult:
 
 
 class DirectiveInterpreter:
-    """Try the primary provider (OpenRouter by default); on failure, try the
-    optional secondary once."""
+    """Interpret operator notes via OpenRouter — the one and only provider.
+
+    A ``fallback`` slot remains only so tests can inject a stub; the production
+    path built by :meth:`from_env` never wires a second provider."""
 
     def __init__(
         self,
@@ -104,20 +103,31 @@ class DirectiveInterpreter:
 
     @classmethod
     def from_env(cls) -> DirectiveInterpreter:
-        primary_name = (_env("LLM_PRIMARY_PROVIDER") or _env("LLM_PROVIDER") or "openrouter").lower()
-        fallback_name = (_env("LLM_FALLBACK_PROVIDER") or "").lower()
-
-        primary = _build_provider(primary_name)
-        fallback = _build_provider(fallback_name) if fallback_name else None
+        # OpenRouter is the sole provider (project requirement). Provider-
+        # selection env vars are intentionally ignored so nothing else is used.
+        primary = build_openrouter_provider()
         try:
             cache_size = int(float(_env("LLM_CACHE_SIZE", "256") or 256))
         except (TypeError, ValueError):
             cache_size = 256
-        return cls(primary=primary, fallback=fallback, cache_size=cache_size)
+        return cls(primary=primary, fallback=None, cache_size=cache_size)
 
-    def interpret(self, operator_notes: list[str]) -> InterpretationResult:
+    def interpret(
+        self,
+        operator_notes: list[str],
+        battery: object | None = None,
+    ) -> InterpretationResult:
         notes = list(operator_notes)
-        cache_key = json.dumps(notes, ensure_ascii=False, sort_keys=False)
+        cap = None
+        if battery is not None:
+            from .llm_contract import _battery_capacity_kwh
+
+            cap = _battery_capacity_kwh(battery)
+        cache_key = json.dumps(
+            {"notes": notes, "capacity_kwh": cap},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         cached = _cache_get(cache_key)
         if cached is not None:
             provider = get_last_provider_used() or "cache"
@@ -128,7 +138,7 @@ class DirectiveInterpreter:
 
         if self._primary is not None:
             try:
-                results = self._primary.interpret(notes, timeout)
+                results = self._primary.interpret(notes, timeout, battery=battery)
                 _cache_put(cache_key, results, self._cache_size)
                 _set_last_provider_used(self._primary.name)
                 logger.info("directive_interpretation provider_used=%s", self._primary.name)
@@ -143,7 +153,7 @@ class DirectiveInterpreter:
 
         if self._fallback is not None:
             try:
-                results = self._fallback.interpret(notes, timeout)
+                results = self._fallback.interpret(notes, timeout, battery=battery)
                 _cache_put(cache_key, results, self._cache_size)
                 _set_last_provider_used(self._fallback.name)
                 logger.info("directive_interpretation provider_used=%s", self._fallback.name)

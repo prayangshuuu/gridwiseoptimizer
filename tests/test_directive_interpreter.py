@@ -57,7 +57,7 @@ class RecordingProvider:
         self.error = error
         self.calls = 0
 
-    def interpret(self, operator_notes, timeout):
+    def interpret(self, operator_notes, timeout, battery=None):
         self.calls += 1
         if self.error:
             raise self.error

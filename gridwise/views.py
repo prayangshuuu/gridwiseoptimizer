@@ -12,7 +12,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .serializers import OptimizeEnergyRequestSerializer, OptimizeEnergyResponseSerializer
 from .llm import interpret_notes, LLMError, get_last_provider_used
-from .fallback import interpret_notes_fallback
+from .fallback import interpret_notes_fallback, reconcile_with_fallback
 from .guardrails import validate_directives, to_interpretation
 from .optimizer import optimize, OptimizerError
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
@@ -199,7 +199,8 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
         fallback_used = False
         llm_provider = None
         try:
-            raw = interpret_notes(notes)
+            raw = interpret_notes(notes, battery=battery)
+            raw = reconcile_with_fallback(raw, notes, battery=battery)
             llm_provider = get_last_provider_used()
         except LLMError as exc:
             logger.warning("LLM interpretation failed; using fallback: %s", exc)

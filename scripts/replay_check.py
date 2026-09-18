@@ -349,6 +349,12 @@ def main() -> int:
             ok, fails = run_case(args.url, case)
         except urllib.error.URLError as e:
             ok, fails = False, [f"connection error: {e.reason} (is the server up?)"]
+        except TimeoutError:
+            # Read timed out: the server accepted the request but did not respond
+            # in time (usually a slow/unbounded LLM call). Report and keep going.
+            ok, fails = False, ["request timed out (server too slow; bound LLM_TIMEOUT/LLM_DEADLINE)"]
+        except OSError as e:
+            ok, fails = False, [f"request failed: {e}"]
         passed += ok
         detail = "ok" if ok else "; ".join(fails[:3])
         print(f"{name.ljust(name_w)}  {'PASS' if ok else 'FAIL'}    {detail}")
