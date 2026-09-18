@@ -1,7 +1,14 @@
 # Pre-submission checklist
 
-Run through this against the **deployed public URL** before submitting. Replace
-`$BASE_URL` with your HTTPS endpoint (e.g. `https://your-app.example.com`).
+Run through this against the **deployed public URL** before submitting.
+
+**Live base URL:** `https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com` (public submission)
+
+Verification scripts default to **`http://localhost:8000` when `/health` is up**, otherwise Heroku. Override with `--url` or `BASE_URL`.
+
+```bash
+export BASE_URL=https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com   # optional: force public
+```
 
 ## 1. Endpoints reachable externally (no auth, no VPN)
 
@@ -9,7 +16,8 @@ Run from a machine that is NOT your dev box (or a phone on cellular) to prove th
 judge can reach it:
 
 ```bash
-scripts/smoke_external.sh "$BASE_URL"
+scripts/smoke_external.sh https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
+# or:  export BASE_URL=https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com && scripts/smoke_external.sh "$BASE_URL"
 ```
 
 - [ ] `GET  $BASE_URL/health` → `200 {"status":"ok"}`
@@ -20,11 +28,11 @@ scripts/smoke_external.sh "$BASE_URL"
 ## 2. Automated checks pass
 
 ```bash
-# Replay tester (needs the server running + the official sample file at repo root)
-uv run scripts/replay_check.py --url "$BASE_URL"
+# Default: local if uvicorn is up, else Heroku. Force public before submit:
+uv run scripts/replay_check.py --url https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
 
-# Paraphrase / interpretation accuracy (uses the configured LLM)
-uv run scripts/interp_check.py           # add --delay 5 on rate-limited tiers
+# Paraphrase check (same URL rule, or --local with OPENROUTER_API_KEY in .env)
+uv run scripts/interp_check.py --url https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
 ```
 
 - [ ] `replay_check.py` → all sample cases PASS

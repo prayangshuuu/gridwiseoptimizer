@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# External smoke test: verify a DEPLOYED public base URL with no auth.
+# External smoke test: GET /health and POST /optimize-energy (no auth).
 #
 # Usage:
-#   scripts/smoke_external.sh https://your-app.example.com
-#   BASE_URL=https://your-app.example.com scripts/smoke_external.sh
+#   scripts/smoke_external.sh
+#   scripts/smoke_external.sh http://localhost:8000
+#   scripts/smoke_external.sh https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
 #
-# Checks:
-#   1. GET  /health           -> 200 and body {"status":"ok"}
-#   2. POST /optimize-energy   -> 200 with a sample 24-hour body
-# Prints status codes and PASS/FAIL; exits non-zero if any check fails.
+# With no argument and no BASE_URL env: use localhost:8000 if /health is ok,
+# otherwise the public Heroku deployment.
 
 set -u
 
-BASE_URL="${1:-${BASE_URL:-}}"
-if [ -z "$BASE_URL" ]; then
-  echo "ERROR: provide BASE_URL as arg 1 or env var." >&2
-  echo "  scripts/smoke_external.sh https://your-app.example.com" >&2
-  exit 2
+LOCAL_BASE_URL="http://localhost:8000"
+PUBLIC_BASE_URL="https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com"
+
+if [ -n "${1:-}" ]; then
+  BASE_URL="$1"
+elif [ -n "${BASE_URL:-}" ]; then
+  :
+else
+  if curl -sf -m 2 "${LOCAL_BASE_URL}/health" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    BASE_URL="$LOCAL_BASE_URL"
+  else
+    BASE_URL="$PUBLIC_BASE_URL"
+  fi
 fi
-BASE_URL="${BASE_URL%/}"   # strip trailing slash
+BASE_URL="${BASE_URL%/}"
 
 pass=0
 fail=0

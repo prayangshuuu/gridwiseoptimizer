@@ -31,8 +31,8 @@ Total 3:00. Keep it tight; screen-record the live run.
   measures paraphrase robustness.
 
 ## 2:20–3:00 — Live run + replay (40s)
+- Public URL: `https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com`
 - `curl` the public `POST /optimize-energy` with a sample body → show the plan,
   directive_interpretation, and totals.
-- Run `uv run scripts/replay_check.py --url $BASE_URL` → **all cases PASS**.
-- Close on `scripts/smoke_external.sh $BASE_URL` proving the public URL needs no
-  auth.
+- Run `uv run scripts/replay_check.py` → **all cases PASS** (defaults to the live public URL).
+- Close on `scripts/smoke_external.sh` proving the public URL needs no auth.

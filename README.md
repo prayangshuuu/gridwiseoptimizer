@@ -1,6 +1,40 @@
 # BUP CSE Fest 2026: LLM-Powered Smart Campus Energy Optimization & Scheduling Platform
 
-## Tech Stack
+## Public judging URL
+
+| | |
+|---|---|
+| **Public deployment** | `https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com` |
+| **Local dev (default when running)** | `http://localhost:8000` |
+| **Health** | `GET /health` → `200` and `{"status":"ok"}` |
+| **Optimize** | `POST /optimize-energy` → JSON plan (no auth, no CSRF) |
+
+**Base URL resolution** (used by `scripts/smoke_external.sh`, `replay_check.py`, and `interp_check.py` when you do not pass `--url` or `$BASE_URL`):
+
+1. If `http://localhost:8000/health` returns `{"status":"ok"}` → use **local**.
+2. Otherwise → use the **Heroku** URL above.
+
+Override anytime:
+
+```bash
+export BASE_URL=http://localhost:8000          # or the Heroku URL
+scripts/smoke_external.sh
+uv run scripts/replay_check.py --url "$BASE_URL"
+```
+
+Quick check (prints which host it chose — local if uvicorn is running, else Heroku):
+
+```bash
+scripts/smoke_external.sh
+curl -s http://localhost:8000/health
+curl -s https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com/health
+```
+
+Judging contract semantics match the official **Problem Statement** and the worked examples in `BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json` at the repo root.
+
+---
+
+## Tech stack
 
 ![Python](https://img.shields.io/badge/Python_3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Django](https://img.shields.io/badge/Django-092E20?style=for-the-badge&logo=django&logoColor=white)
@@ -16,348 +50,342 @@
 
 ## Overview
 
-A REST service that turns a 24-hour campus energy scenario plus free-text
-operator notes into a cost-minimal battery-and-grid dispatch plan. Two public
-endpoints:
+A REST service that turns a **24-hour** campus energy scenario plus **1–3 free-text operator notes** into a **cost-minimal**, constraint-safe battery-and-grid dispatch plan.
 
-| Method | Path               | Purpose                                             |
-|--------|--------------------|-----------------------------------------------------|
-| GET    | `/health`          | Liveness probe → `200 {"status":"ok"}` (no DB).     |
-| POST   | `/optimize-energy` | Validate → interpret notes → optimize → return plan.|
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Readiness → `200` and `{"status":"ok"}` (no database). |
+| `POST` | `/optimize-energy` | Validate → LLM interpret notes → guardrails → optimize → JSON response. |
 
-The public API uses DRF with `AllowAny` and **no** SessionAuthentication (set
-per-view so the rest of the site's allauth/session auth is untouched); it is
-CSRF-exempt and `/health` has no database dependency.
+The judging endpoints use Django REST framework with **`AllowAny`**, **no** `SessionAuthentication` (configured per view so site allauth remains unchanged), and are **CSRF-exempt**. Optional OpenAPI UI lives at `/api/docs/` and `/api/redoc/`; scoring uses the Problem Statement JSON contract, not Swagger field names.
 
-## Architecture: LLM → Guardrails → Optimizer
+---
+
+## Architecture: LLM → guardrails → optimizer
 
 ```
 POST /optimize-energy
         │
         ▼
-1. Serializer validation        gridwise/serializers.py
-        │   400 malformed JSON · 422 well-formed-but-invalid
+1. Request validation          gridwise/serializers.py
+        │   400 malformed JSON · 422 well-formed but invalid
         ▼
-2. LLM interpretation           gridwise/llm.py   →  interpret_notes()
-        │   free-text notes → RAW structured directives (UNTRUSTED)
-        │   OpenRouter (OpenAI-compatible); model/key from env; typed LLMError
+2. LLM interpretation          gridwise/llm.py → interpret_notes()
+        │   OpenRouter (OpenAI-compatible chat completions, JSON mode)
+        │   Structured output validated in gridwise/llm_contract.py
         ▼
-3. Deterministic guardrails     gridwise/guardrails.py → validate_directives()
-        │   pure Python: enforce shape/ranges; coerce anything
-        │   malformed/unsupported to a safe no_op; never trust the LLM
+3. Reserve alignment (determ.) gridwise/llm_contract.py → align_minimum_reserves_from_notes()
+        │   Raises under-specified kWh reserves when the note text implies more
         ▼
-4. Linear program               gridwise/optimizer.py → optimize()
-        │   PuLP + CBC; minimize Σ grid[h]·tariff[h]
+4. Deterministic guardrails    gridwise/guardrails.py → validate_directives()
+        │   Coerce malformed / unsupported entries to safe no_op; never trust raw LLM JSON
         ▼
-5. Response (totals RECOMPUTED from hourly_plan)     gridwise/views.py
+5. Linear program              gridwise/optimizer.py → optimize()
+        │   PuLP + CBC; minimize Σ grid[h] × tariff[h]
+        ▼
+6. Response                    gridwise/views.py
+        │   Totals recomputed from hourly_plan (single source of truth)
 ```
 
-**Why guardrails between the LLM and the optimizer?** The LLM output is treated
-as untrusted. Guardrails validate every field (directive type in the allowed
-set, hours as unique ints 0–23, `factor ∈ [0,1]`, `minimum_energy_kwh ∈ [0, capacity]`,
-`max_grid_kwh ≥ 0`) and coerce any malformed or unsupported entry into an inert
-`no_op` instead of failing or inventing behavior. The optimizer only ever sees
-clean, typed directives, and the LP itself is what the judge independently
-replays.
+**Why guardrails?** The LLM proposes directives; guardrails enforce allowed types, hour lists (unique ints `0…23`, ascending), numeric ranges, and `no_op` semantics before anything reaches the LP.
 
-### The six directive types
+**API path:** interpretation is **always** via OpenRouter on `POST /optimize-energy`. The module `gridwise/fallback.py` is a **deterministic keyword parser used in unit tests only** — it is not wired into the live HTTP pipeline.
 
-| directive_type            | structured_adjustment                    | Effect in the LP                                    |
-|---------------------------|------------------------------------------|-----------------------------------------------------|
-| `solar_reduction`         | `{hours, factor}` (0–1)                  | `effective_solar[h] *= factor`                      |
-| `minimum_battery_reserve` | `{hours, minimum_energy_kwh}` (≤ capacity)| raise SoC floor: `after[h] ≥ max(base, minimum_energy_kwh)` |
-| `no_charge_window`        | `{hours}`                                | `charge[h] = 0`                                     |
-| `no_discharge_window`     | `{hours}`                                | `discharge[h] = 0`                                  |
-| `max_grid_window`         | `{hours, max_grid_kwh}`                  | `grid[h] ≤ max_grid_kwh`                            |
-| `no_op`                   | `null`                                   | none (note carried no actionable instruction)      |
+### Six directive types
+
+| `directive_type` | `structured_adjustment` when `applies: true` | Effect in the LP |
+|------------------|-----------------------------------------------|------------------|
+| `solar_reduction` | `{ "hours", "factor" }` — `factor` ∈ [0,1] is **usable solar remaining** (80% cut → `0.2`) | `effective_solar[h] *= factor` on listed hours |
+| `minimum_battery_reserve` | `{ "hours", "minimum_energy_kwh" }` (≤ capacity) | Raise SoC floor on listed hours |
+| `no_charge_window` | `{ "hours" }` | `charge[h] = 0` |
+| `no_discharge_window` | `{ "hours" }` | `discharge[h] = 0` |
+| `max_grid_window` | `{ "hours", "max_grid_kwh" }` | `grid[h] ≤ max_grid_kwh` |
+| `no_op` | `null` — **`applies` must be `false`** | No change |
+
+**Time windows:** ranges like “1 PM to 3 PM” are **start-inclusive, end-exclusive** → hours `[13, 14]`. Same rule in the LLM prompt, guardrails, public sample pack, and `tests/paraphrase_cases.json`.
+
+---
+
+## JSON contract (summary)
+
+Canonical detail is in the Problem Statement and in `BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json` → `_meta.schema_notes`.
+
+**Request (required):** `scenario_id`, `operator_notes` (1–3 strings), `hours` (exactly 24 objects with `hour`, `demand_kwh`, `solar_kwh`, `tariff_bdt_per_kwh`), `battery`.
+
+**Battery** — either Problem Statement names or short aliases (normalized internally):
+
+| Canonical (Problem Statement) | Also accepted |
+|------------------------------|---------------|
+| `capacity_kwh` | `capacity` |
+| `initial_energy_kwh` | `initial_energy` |
+| `minimum_energy_kwh` | `minimum_energy` |
+| `max_charge_kwh_per_hour` | `max_charge` |
+| `max_discharge_kwh_per_hour` | `max_discharge` |
+
+**Response (required):** `scenario_id`, `directive_interpretation`, `hourly_plan`, `total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`, `plan_summary`.
+
+Each **`directive_interpretation`** entry: `note_index`, `applies`, `directive_type`, `structured_adjustment`, `explanation` — **one entry per operator note**, indices `0…N-1`.
+
+Each **`hourly_plan`** hour: `hour`, `grid_kwh`, `solar_used_kwh`, `battery_action` (`charge` | `discharge` | `idle`), `battery_kwh` (signed: + charge, − discharge), `battery_energy_after_kwh`.
+
+Signed battery rule: `battery_energy_after_kwh[h] = battery_energy_after_kwh[h-1] + battery_kwh[h]` (hour `0` uses `initial_energy` as prior state).
+
+---
 
 ## Local quickstart
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.12.
 
 ```bash
-uv sync                        # install from uv.lock
-cp .env.example .env           # then edit .env (see env vars below)
+uv sync
+cp .env.example .env          # set OPENROUTER_API_KEY (see below)
 
-# Apply migrations only if you use a database (optional; not needed for /health).
+# Optional: only if you use Postgres/SQLite audit logging
 uv run python manage.py migrate
 
-# Run the ASGI server (binds 0.0.0.0)
 uv run uvicorn core.asgi:application --host 0.0.0.0 --port 8000
 ```
 
-> On Apple Silicon, PuLP's bundled CBC solver is x86-64 and will not run
-> natively. Install a native solver with `brew install cbc` — the optimizer
-> auto-detects a `cbc` on `PATH` and otherwise falls back to the bundled one
-> (which works on the Linux deploy image).
+Apple Silicon: PuLP’s bundled CBC is x86-64. Install native CBC with `brew install cbc` (auto-detected on `PATH`); Linux deploy images use the bundled solver.
 
-### Environment variables (names only — never commit real values)
+### Environment variables (names only — never commit secrets)
 
-All LLM settings are read from `gridwise/llm_env.py`. **OpenRouter is the only
-provider** (no multi-provider fallback in code).
+All LLM settings are read from `gridwise/llm_env.py`. **OpenRouter is the only provider.**
 
-| Variable               | Required | Purpose |
-|------------------------|----------|---------|
-| `SECRET_KEY`           | prod     | Django secret key. |
-| `DEBUG`                | no       | `True`/`False` (default `False`). |
-| `ALLOWED_HOSTS`        | no       | Comma-separated hosts. |
-| `DATABASE_URL`         | no       | Postgres DSN. Absent → SQLite; `/health` needs no DB. |
-| `OPENROUTER_API_KEY`   | yes*     | OpenRouter key(s), comma-separated (rotation on auth/`429`). |
-| `LLM_MODEL`            | no       | OpenRouter model id (default `deepseek/deepseek-v4.1-flash`). |
-| `LLM_BASE_URL`         | no       | API base (default `https://openrouter.ai/api/v1`). |
-| `LLM_REASONING`        | no       | `off` (default, fastest) · `low`/`medium`/`high` · or omit for model default. |
-| `LLM_TIMEOUT`          | no       | Read timeout seconds; `0` = disabled (slow free tier can finish). |
-| `LLM_TIMEOUT_SECONDS`  | no       | Alias for `LLM_TIMEOUT`. |
-| `LLM_CONNECT_TIMEOUT`  | no       | Connect timeout when read timeout is off (default `30`). |
-| `LLM_MAX_RETRIES`      | no       | Retries on transient errors / bad JSON (default `3`). |
-| `LLM_RETRY_BACKOFF`    | no       | Exponential backoff base seconds (default `0.5`). |
-| `LLM_DEADLINE`         | no       | Overall retry budget; `0` = unlimited (retries capped by `LLM_MAX_RETRIES`). |
-| `LLM_MAX_TOKENS`       | no       | Cap completion tokens (else scales with note count). |
-| `LLM_CACHE_SIZE`       | no       | LRU cache entries for identical note lists (default `256`). |
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `SECRET_KEY` | production | Django secret key |
+| `DEBUG` | no | `True` / `False` (default `False`) |
+| `ALLOWED_HOSTS` | production | Comma-separated hosts (e.g. `gridwiseoptimizer-5541fa80b3e4.herokuapp.com`) |
+| `DATABASE_URL` | no | Postgres DSN; omit for SQLite. `/health` needs no DB |
+| `OPENROUTER_API_KEY` | yes* | Comma-separated keys (rotation on auth / `429`) |
+| `LLM_MODEL` | no | Default `deepseek/deepseek-v4.1-flash` |
+| `LLM_BASE_URL` | no | Default `https://openrouter.ai/api/v1` |
+| `LLM_REASONING` | no | `off` (default) · `low` / `medium` / `high` |
+| `LLM_TIMEOUT` / `LLM_TIMEOUT_SECONDS` | no | Read timeout seconds; `0` = no read cap |
+| `LLM_CONNECT_TIMEOUT` | no | Connect timeout when read timeout off (default `30`) |
+| `LLM_MAX_RETRIES` | no | Default `3` |
+| `LLM_RETRY_BACKOFF` | no | Default `0.5` |
+| `LLM_DEADLINE` | no | Overall retry budget; `0` = unlimited |
+| `LLM_MAX_TOKENS` | no | Cap completion tokens |
+| `LLM_CACHE_SIZE` | no | LRU cache entries for identical note lists (default `256`) |
 
-\* Required for `POST /optimize-energy` unless you only use `GET /health`.
+\* Required for `POST /optimize-energy` (not for `GET /health`).
 
-## LLM: OpenRouter + DeepSeek
-
-Interpretation uses **OpenRouter** with the **OpenAI-compatible** Chat
-Completions API (`gridwise/llm_providers.py`). The deployed default model is
-**`deepseek/deepseek-v4.1-flash`** — fast structured JSON for operator notes.
-
-Copy from `.env.example` and set your key:
+Example `.env` fragment:
 
 ```bash
 OPENROUTER_API_KEY=<your-key>
 LLM_MODEL=deepseek/deepseek-v4.1-flash
-LLM_REASONING=off          # disable chain-of-thought on free-tier routes
-LLM_TIMEOUT=0              # no read cap; connect still times out at 30s
+LLM_REASONING=off
+LLM_TIMEOUT=0
 LLM_MAX_RETRIES=3
 LLM_DEADLINE=0
 ```
 
-To try another OpenRouter model, change `LLM_MODEL` only (same key and base URL).
+---
 
 ## API examples
-
-The API is documented via OpenAPI 3. You can browse the interactive documentation at `/api/docs/` (Swagger UI) or `/api/redoc/` (ReDoc). These are optional convenience surfaces; judging uses the contract in the Problem Statement.
 
 ### `GET /health`
 
 ```bash
-curl -s https://gridwiseoptimizer-a38603e4c359.herokuapp.com/health
-# {"status": "ok"}
+# Uses local server if uvicorn is running; otherwise Heroku (see smoke_external.sh)
+scripts/smoke_external.sh
+# Or force a host:
+curl -s http://localhost:8000/health
+curl -s https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com/health
 ```
 
 ### `POST /optimize-energy`
 
+Use a **valid** 24-hour body. Fastest checks:
+
 ```bash
-curl -s -X POST https://gridwiseoptimizer-a38603e4c359.herokuapp.com/optimize-energy \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scenario_id": "demo-1",
-    "operator_notes": [
-      "Cloudy from noon to 2pm, cut solar by half.",
-      "Do not charge the battery during the 5pm-9pm peak.",
-      "Great work on the night shift, thanks all!"
-    ],
-    "hours": [
-      {"hour": 0, "demand_kwh": 2.0, "solar_kwh": 0.0, "tariff_bdt_per_kwh": 5.0}
-      /* ... exactly 24 entries, hours 0..23 unique ... */
-    ],
-    "battery": {
-      "capacity": 10, "initial_energy": 4, "minimum_energy": 1,
-      "max_charge": 3, "max_discharge": 3
-    }
-  }'
+scripts/smoke_external.sh
+uv run scripts/replay_check.py          # all cases in BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json
 ```
 
-Response (abridged):
+Minimal manual POST (same shape as `scripts/smoke_external.sh`):
+
+```bash
+```bash
+curl -s -X POST "${BASE_URL:-http://localhost:8000}/optimize-energy" \
+  -H "Content-Type: application/json" \
+  -d @- <<'EOF'
+{
+  "scenario_id": "demo-1",
+  "operator_notes": [
+    "Cloudy from noon to 4pm, cut solar by 30%.",
+    "Do not charge the battery from 5pm to 9pm.",
+    "Great work on the night shift, thanks all!"
+  ],
+  "hours": [
+    {"hour":0,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":1,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":2,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":3,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":4,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":5,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":6,"demand_kwh":2,"solar_kwh":1,"tariff_bdt_per_kwh":5},
+    {"hour":7,"demand_kwh":2,"solar_kwh":1,"tariff_bdt_per_kwh":5},
+    {"hour":8,"demand_kwh":2,"solar_kwh":2,"tariff_bdt_per_kwh":5},
+    {"hour":9,"demand_kwh":2,"solar_kwh":3,"tariff_bdt_per_kwh":5},
+    {"hour":10,"demand_kwh":2,"solar_kwh":4,"tariff_bdt_per_kwh":5},
+    {"hour":11,"demand_kwh":2,"solar_kwh":4,"tariff_bdt_per_kwh":5},
+    {"hour":12,"demand_kwh":2,"solar_kwh":4,"tariff_bdt_per_kwh":5},
+    {"hour":13,"demand_kwh":2,"solar_kwh":4,"tariff_bdt_per_kwh":5},
+    {"hour":14,"demand_kwh":2,"solar_kwh":4,"tariff_bdt_per_kwh":5},
+    {"hour":15,"demand_kwh":2,"solar_kwh":3,"tariff_bdt_per_kwh":5},
+    {"hour":16,"demand_kwh":2,"solar_kwh":2,"tariff_bdt_per_kwh":5},
+    {"hour":17,"demand_kwh":2,"solar_kwh":1,"tariff_bdt_per_kwh":15},
+    {"hour":18,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":15},
+    {"hour":19,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":15},
+    {"hour":20,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":15},
+    {"hour":21,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":15},
+    {"hour":22,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5},
+    {"hour":23,"demand_kwh":2,"solar_kwh":0,"tariff_bdt_per_kwh":5}
+  ],
+  "battery": {
+    "capacity_kwh": 10,
+    "initial_energy_kwh": 4,
+    "minimum_energy_kwh": 1,
+    "max_charge_kwh_per_hour": 3,
+    "max_discharge_kwh_per_hour": 3
+  }
+}
+EOF
+```
+
+Response shape (abridged):
 
 ```json
 {
   "scenario_id": "demo-1",
   "directive_interpretation": [
-    {"note_index": 0, "applies": true, "directive_type": "solar_reduction",
-     "structured_adjustment": {"hours": [12, 13], "factor": 0.5}},
-    {"note_index": 1, "applies": true, "directive_type": "no_charge_window",
-     "structured_adjustment": {"hours": [17, 18, 19, 20]}},
-    {"note_index": 2, "applies": false, "directive_type": "no_op",
-     "structured_adjustment": null}
+    {
+      "note_index": 0,
+      "applies": true,
+      "directive_type": "solar_reduction",
+      "structured_adjustment": {"hours": [12, 13, 14, 15], "factor": 0.7},
+      "explanation": "..."
+    },
+    {
+      "note_index": 1,
+      "applies": true,
+      "directive_type": "no_charge_window",
+      "structured_adjustment": {"hours": [17, 18, 19, 20]},
+      "explanation": "..."
+    },
+    {
+      "note_index": 2,
+      "applies": false,
+      "directive_type": "no_op",
+      "structured_adjustment": null,
+      "explanation": "..."
+    }
   ],
   "hourly_plan": [
-    {"hour": 0, "grid_kwh": 1.0, "solar_used_kwh": 0.0,
-     "battery_action": "discharge", "battery_kwh": -1.0,
-     "battery_energy_after_kwh": 3.0}
-    /* ... 24 entries ... */
+    {
+      "hour": 0,
+      "grid_kwh": 1.0,
+      "solar_used_kwh": 0.0,
+      "battery_action": "discharge",
+      "battery_kwh": -1.0,
+      "battery_energy_after_kwh": 3.0
+    }
   ],
   "total_grid_kwh": 25.0,
   "total_cost_bdt": 135.0,
   "peak_grid_kwh": 5.0,
-  "plan_summary": "Imports 25.00 kWh from grid at 135.00 BDT; peak 5.00 kWh at hour 23. Battery charges in 6 hour(s), discharges in 7 hour(s)."
+  "plan_summary": "Imports 25.00 kWh from grid at 135.00 BDT; ..."
 }
 ```
 
-`battery_kwh` is signed: **positive = charge into the battery, negative =
-discharge**, `0` when idle, so `battery_energy_after_kwh[h] =
-battery_energy_after_kwh[h-1] + battery_kwh[h]`. Every total is recomputed from
-`hourly_plan`.
+**HTTP status codes:** `200` success · `400` malformed JSON · `422` validation error · `500` controlled failure (LLM exhausted retries, infeasible LP, or unexpected error — no stack traces or secrets in the body).
 
-**Status codes:** `200` success · `400` malformed JSON · `422` well-formed but
-invalid · `500` controlled error (LLM outage after retries, guardrail/optimizer
-failure, or unexpected error; no stack traces or secrets).
+---
 
-## Reliability & performance
+## Reliability and performance
 
-Everything is engineered to stay within a **30s/request** budget and target
-**≤5s p95** where the model responds quickly:
+- Target **≤ 5 s p95** when the model responds quickly; hard per-request budget **30 s** on the judging side.
+- **Retries:** transient OpenRouter errors, bad JSON, and `5xx` with exponential backoff (`LLM_MAX_RETRIES`, `LLM_RETRY_BACKOFF`, optional `LLM_DEADLINE`).
+- **Key rotation:** comma-separated `OPENROUTER_API_KEY` on auth failure and `429`.
+- **`LLM_REASONING=off`** avoids slow chain-of-thought on free-tier routes.
+- **LRU cache** keyed by operator notes (+ battery capacity), size `LLM_CACHE_SIZE`.
+- **Logs:** `scenario_id`, path, status, `latency_ms`, `llm_provider` — never keys, prompts, or full bodies.
 
-- **OpenRouter with retries.** Transient timeouts, connection errors, `5xx`, and
-  malformed JSON responses are retried with exponential backoff (env-tuned).
-  Comma-separated `OPENROUTER_API_KEY` values rotate on auth failures and `429`.
-- **`LLM_REASONING=off`** by default so free-tier reasoning models skip slow
-  chain-of-thought tokens.
-- **In-memory LRU cache** keyed by `operator_notes` (+ battery capacity), sized by
-  `LLM_CACHE_SIZE`, for repeat interpretations.
-- **Structured logging** of `scenario_id`, `path`, `status`, `latency_ms`,
-  `llm_provider` — never API keys, prompt text, or full request bodies.
+If OpenRouter remains unavailable after retries, the API returns **`500`** with `{"detail":"Failed to optimize the scenario."}` (no silent non-LLM fallback on the HTTP path).
 
-## Reproducibility test — replay checker
+---
 
-`scripts/replay_check.py` mirrors the contest judge. For each sample case it
-POSTs `input` to a running server, then **independently re-derives** every
-constraint and verifies the returned `hourly_plan`: 24 unique hours; per-hour
-energy balance within 0.01; `solar_used ≤ effective solar`; battery bounds,
-rate limits, state transitions and active reserve; `no_charge_window` /
-`no_discharge_window` / `max_grid_window` obeyed; end-of-day battery = initial; and reported totals match the
-plan. It also compares `directive_interpretation` (type + hours + numeric
-values, ignoring free-text) against each case's `expected_output`.
+## Verification scripts (judge-style)
+
+Place `BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json` at the repo root (included in this repository).
+
+### `scripts/replay_check.py`
+
+Independent replay of constraints and directive semantics for all **10 public sample cases**. Default target: **localhost:8000 if `/health` is up, else Heroku** (override with `--url`).
 
 ```bash
-# 1. Start the server in one shell:
-uv run uvicorn core.asgi:application --host 0.0.0.0 --port 8000
-
-# 2. Place the official sample file at the repo root, then in another shell:
 uv run scripts/replay_check.py
-#   optional overrides:
-#   uv run scripts/replay_check.py --file path/to/cases.json --url https://gridwiseoptimizer-a38603e4c359.herokuapp.com
+uv run scripts/replay_check.py --url http://localhost:8000
+uv run scripts/replay_check.py --url https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
+uv run scripts/replay_check.py --file path/to/cases.json
 ```
 
-Expected output — a per-case table and an overall count:
+Exit codes: `0` all pass · `1` any fail · `2` missing cases file.
 
-```
-Loaded N case(s) from .../BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json
-Target: https://gridwiseoptimizer-a38603e4c359.herokuapp.com/optimize-energy
+### `scripts/interp_check.py`
 
-CASE        RESULT  DETAIL
-----------  ------  ------
-solar+peak  PASS    ok
-...
-
-N/N cases passed.
-```
-
-The script exits `0` when all cases pass, `1` if any fail, `2` if the cases file
-is missing. It needs only the Python standard library.
-
-## Paraphrase-robustness test — interpretation checker
-
-`scripts/interp_check.py` runs `interpret_notes` → `validate_directives` over
-`tests/paraphrase_cases.json` (4–6 differently-worded notes per directive type —
-varied phrasing, 12h/24h clocks, percentages/fractions — plus `no_op`
-distractors and two hard combos). It compares each result on **directive_type +
-hours + numeric values** (free-text ignored) and reports per-directive accuracy.
+Paraphrase robustness over `tests/paraphrase_cases.json`. Default HTTP target: same rule as replay (**local if up, else Heroku**). **`--local`:** in-process `interpret_notes` (needs `OPENROUTER_API_KEY` in `.env`).
 
 ```bash
 uv run scripts/interp_check.py
-# On rate-limited free tiers, space out the calls:
 uv run scripts/interp_check.py --delay 5
+uv run scripts/interp_check.py --local
+uv run scripts/interp_check.py --url http://localhost:8000
 ```
 
-```
-CASE                     RESULT  DETAIL
------------------------  ------  ------
-solar_reduction/percent  PASS    ok
-...
-N/N cases passed.
+### `scripts/smoke_external.sh`
 
-Per-directive accuracy:
-  solar_reduction            6/6  (100%)
-  ...
-```
-
-Hour convention (shared by the prompt, the fallback, and these cases): a range
-**"A to B" covers hour A up to but NOT including hour B** (endpoint-exclusive),
-and `solar_reduction.factor` is the **fraction of solar remaining** after the
-cut. Use failures here to tighten `gridwise/llm.py`'s prompt.
-
-## Deploy to a public HTTPS host
-
-The judge calls a **public base URL with no auth/VPN**, so deploy anywhere that
-gives HTTPS and injects env vars. The repo ships a container build
-(`Dockerfile` + `heroku.yml`) that binds `0.0.0.0` on `$PORT` and bakes in no
-secrets.
-
-**Heroku (container stack)** — example:
+External smoke test: `GET /health` and `POST /optimize-energy` with a built-in valid body. **No args:** probes local, then Heroku.
 
 ```bash
-heroku create your-app
-heroku stack:set container -a your-app
-# Secrets via platform config vars (never in the repo/image):
-heroku config:set -a your-app \
+scripts/smoke_external.sh
+scripts/smoke_external.sh http://localhost:8000
+scripts/smoke_external.sh https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
+```
+
+See also `docs/SUBMISSION_CHECKLIST.md` and `docs/VIDEO_OUTLINE.md`.
+
+---
+
+## Deploy (Heroku container)
+
+```bash
+heroku stack:set container -a gridwiseoptimizer-5541fa80b3e4
+heroku config:set -a gridwiseoptimizer-5541fa80b3e4 \
   SECRET_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(50))')" \
   DEBUG=False \
-  ALLOWED_HOSTS="your-app.herokuapp.com" \
+  ALLOWED_HOSTS="gridwiseoptimizer-5541fa80b3e4.herokuapp.com" \
   OPENROUTER_API_KEY="<your-key>" \
   LLM_MODEL=deepseek/deepseek-v4.1-flash \
   LLM_REASONING=off
-git push heroku main          # builds Dockerfile; release runs migrate + seed
+git push heroku main
 ```
 
-The same image runs on any container host (Render, Railway, Fly.io, Cloud Run):
-build the `Dockerfile`, expose the container's `$PORT`, and set the env vars
-below. TLS/HTTPS is terminated by the platform; keep `SECURE_SSL_REDIRECT`
-enabled in production (the app trusts `X-Forwarded-Proto`).
+The `Dockerfile` binds **`0.0.0.0`** on **`$PORT`**. Release phase runs migrations (and optional `seed` when configured) per `heroku.yml`. **No secrets** are baked into the image.
 
-**Exact env vars to set on the platform** (none live in the repo or image):
+The same container pattern works on Render, Railway, Fly.io, Cloud Run, etc.: build `Dockerfile`, expose `$PORT`, set the env vars above, terminate TLS at the edge.
 
-| Variable | Notes |
-|----------|-------|
-| `SECRET_KEY` | required in production |
-| `DEBUG` | `False` in production |
-| `ALLOWED_HOSTS` | your public host(s), comma-separated |
-| `DATABASE_URL` | optional; set it to enable audit logging + migrations |
-| `OPENROUTER_API_KEY`, `LLM_MODEL` | required for optimization |
-| `LLM_REASONING`, `LLM_TIMEOUT`, `LLM_MAX_RETRIES`, `LLM_DEADLINE`, `LLM_CACHE_SIZE`, `LLM_BASE_URL` | optional tuning |
+---
 
-**No authentication is required on the judging path.** `/health` and
-`/optimize-energy` are `AllowAny`, have no SessionAuthentication, and are
-CSRF-exempt — a plain `curl` from anywhere works once deployed.
-
-## External verification
-
-After deploying, confirm both endpoints from **outside** your machine (another
-host, or a phone on cellular) before locking the URL:
+## Docker fallback (local)
 
 ```bash
-scripts/smoke_external.sh https://your-app.example.com
-# or:  BASE_URL=https://your-app.example.com scripts/smoke_external.sh
-```
-
-It curls `GET /health` (expects `200 {"status":"ok"}`) and `POST
-/optimize-energy` with a sample body, prints the status codes and PASS/FAIL, and
-exits non-zero if anything fails. See `docs/SUBMISSION_CHECKLIST.md` for the full
-pre-submit checklist and `docs/VIDEO_OUTLINE.md` for the 3-minute demo script.
-
-## Docker fallback
-
-The image installs from the uv lockfile, binds `0.0.0.0` on `$PORT`, runs
-migrations **only when `DATABASE_URL` is set**, and bakes in **no secrets**
-(they come from runtime env).
-
-```bash
-# Build
 docker build -t gridwise-web:latest .
 
-# Run (no database needed for /health), then probe it. Port: 8000 in-container.
 docker run --rm -p 8000:8000 \
   -e SECRET_KEY=change-me \
   -e SECURE_SSL_REDIRECT=False \
@@ -366,55 +394,51 @@ docker run --rm -p 8000:8000 \
   -e LLM_REASONING=off \
   gridwise-web:latest
 
-curl -s https://gridwiseoptimizer-a38603e4c359.herokuapp.com/health      # {"status": "ok"}
+curl -s http://127.0.0.1:8000/health    # {"status":"ok"}
 ```
 
-With Compose (Postgres is optional, behind a profile):
+Compose (optional Postgres profile):
 
 ```bash
-docker compose up --build                       # web only; /health works, no DB
-docker compose --profile postgres up --build    # web + Postgres
+docker compose up --build
+docker compose --profile postgres up --build
 ```
 
-> When running the container directly over plain HTTP, pass
-> `-e SECURE_SSL_REDIRECT=False` (or `-e DEBUG=True`); otherwise Django's
-> production HTTPS redirect turns `/health` into a 301. Behind a TLS proxy
-> (e.g. Heroku) leave it enabled.
+For plain HTTP locally, keep `SECURE_SSL_REDIRECT=False` (or `DEBUG=True`). Behind Heroku’s TLS proxy, leave SSL redirect enabled in production.
+
+After rebuilding, re-run `uv run scripts/replay_check.py --url http://127.0.0.1:8000` before relying on a stale local image.
+
+---
 
 ## Credited dependencies
 
-- [Django](https://www.djangoproject.com/) — web framework
-- [Django REST framework](https://www.django-rest-framework.org/) — API layer
-- [PuLP](https://coin-or.github.io/pulp/) with the
-  [CBC](https://github.com/coin-or/Cbc) solver — the linear program
-- [openai](https://github.com/openai/openai-python) — OpenAI-compatible client
-  (OpenRouter Chat Completions)
-- [django-environ](https://django-environ.readthedocs.io/) — env-based settings
-- [Uvicorn](https://www.uvicorn.org/) — ASGI server
-- [psycopg](https://www.psycopg.org/) — PostgreSQL driver
-- [WhiteNoise](https://whitenoise.readthedocs.io/) — static files
-- [django-allauth](https://docs.allauth.org/) — site auth (unrelated to the public API)
-- [uv](https://docs.astral.sh/uv/) — packaging / lockfile
+- [Django](https://www.djangoproject.com/) — web framework  
+- [Django REST framework](https://www.django-rest-framework.org/) — API layer  
+- [PuLP](https://coin-or.github.io/pulp/) + [CBC](https://github.com/coin-or/Cbc) — linear program  
+- [openai](https://github.com/openai/openai-python) — OpenAI-compatible client (OpenRouter)  
+- [django-environ](https://django-environ.readthedocs.io/) — settings from env  
+- [Uvicorn](https://www.uvicorn.org/) — ASGI server  
+- [psycopg](https://www.psycopg.org/) — PostgreSQL driver  
+- [WhiteNoise](https://whitenoise.readthedocs.io/) — static files  
+- [django-allauth](https://docs.allauth.org/) — site auth (not used on judging endpoints)  
+- [uv](https://docs.astral.sh/uv/) — lockfile and installs  
+
+AI coding assistants and public libraries/APIs were used during development; core pipeline design is team-owned.
+
+---
 
 ## Known limitations
 
-- **LLM availability**: interpretation depends on OpenRouter. Retries and key
-  rotation absorb transient errors; persistent failure yields a controlled `500`.
-- **CBC architecture**: PuLP's bundled CBC is x86-64; native Apple Silicon needs
-  `brew install cbc` (auto-detected). The Linux deploy image runs the bundled
-  solver.
-- **Model assumptions**: lossless battery (no round-trip efficiency), whole-hour
-  granularity, and a hard end-of-day = initial state-of-charge constraint.
-- **Audit logging is best-effort**: the `OptimizationRun` row is written in a
-  guarded `try/except` and is silently skipped if no database is reachable — it
-  never blocks or fails the response.
+- **OpenRouter dependency:** persistent provider failure → controlled `500` after retries.  
+- **CBC on Apple Silicon:** install system `cbc` via Homebrew when needed.  
+- **Model:** lossless battery, hourly granularity, end-of-day SoC equals initial energy.  
+- **Audit logging:** `OptimizationRun` DB rows are best-effort and skipped if no DB is reachable.  
+
+---
 
 ## Secret handling
 
-- **No real keys in the repo.** `.env` is git-ignored and Docker-ignored; only
-  `.env.example` (placeholders) is committed.
-- Secrets are read from the runtime environment (`-e` / `--env-file` / platform
-  config vars), never baked into the image or logged.
-- The `500` error path and all responses are scrubbed of stack traces and
-  secrets.
-- If a key is ever exposed, rotate it at the provider immediately.
+- **Never commit real keys.** `.env` is git-ignored; only `.env.example` (placeholders) is tracked.  
+- Inject secrets via platform config vars, `docker run -e`, or `--env-file` at runtime.  
+- Error responses do not include stack traces, file paths, or provider secrets.  
+- Rotate any exposed key at OpenRouter immediately.  

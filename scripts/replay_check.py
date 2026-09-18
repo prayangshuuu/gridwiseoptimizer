@@ -12,7 +12,10 @@ implementation so a passing result means the server's plan is genuinely valid.
 
 Usage:
     uv run scripts/replay_check.py
-    uv run scripts/replay_check.py --file path/to/cases.json --url http://localhost:8000
+    uv run scripts/replay_check.py --url http://localhost:8000
+    uv run scripts/replay_check.py --url https://gridwiseoptimizer-5541fa80b3e4.herokuapp.com
+
+Default base URL: localhost:8000 when /health responds; otherwise the public Heroku app.
 """
 from __future__ import annotations
 
@@ -29,7 +32,6 @@ BOUND_TOL = 1e-4            # slack for battery bounds / rate limits
 NUM_TOL = 1e-6             # numeric equality for directive values / totals
 
 DEFAULT_FILENAME = "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
-DEFAULT_URL = "http://localhost:8000"
 
 
 # --------------------------------------------------------------------------- #
@@ -325,14 +327,22 @@ def run_case(base_url: str, case: dict) -> tuple[bool, list[str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--file", help=f"Path to {DEFAULT_FILENAME}")
-    ap.add_argument("--url", default=DEFAULT_URL, help="Base URL of the running server")
+    ap.add_argument(
+        "--url",
+        default=None,
+        help="Base URL (default: localhost:8000 if up, else public Heroku deployment)",
+    )
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
+    scripts_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(root))
+    sys.path.insert(0, str(scripts_dir))
     from gridwise.llm_env import load_dotenv
+    from base_url import resolve_base_url
 
     load_dotenv()
+    base_url = resolve_base_url(args.url)
 
     try:
         path = find_cases_file(args.file)
@@ -342,7 +352,7 @@ def main() -> int:
         return 2
 
     print(f"Loaded {len(cases)} case(s) from {path}")
-    print(f"Target: {args.url}/optimize-energy\n")
+    print(f"Target: {base_url}/optimize-energy\n")
 
     name_w = max([len("CASE")] + [len(case_name(c, i)) for i, c in enumerate(cases)])
     print(f"{'CASE'.ljust(name_w)}  RESULT  DETAIL")
@@ -352,7 +362,7 @@ def main() -> int:
     for i, case in enumerate(cases):
         name = case_name(case, i)
         try:
-            ok, fails = run_case(args.url, case)
+            ok, fails = run_case(base_url, case)
         except urllib.error.URLError as e:
             ok, fails = False, [f"connection error: {e.reason} (is the server up?)"]
         except TimeoutError:
