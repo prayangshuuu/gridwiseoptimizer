@@ -114,11 +114,20 @@ def post_optimize(base_url: str, body: dict, timeout: float = 35.0):
 # --------------------------------------------------------------------------- #
 # Independent replay of the plan                                              #
 # --------------------------------------------------------------------------- #
+def _bat(battery: dict, *keys) -> float:
+    """Read a battery field, tolerating both the _kwh request field names and
+    the older short names."""
+    for k in keys:
+        if k in battery:
+            return float(battery[k])
+    raise KeyError(f"battery missing any of {keys}")
+
+
 def _derive_params(inp: dict, directives: list[dict]):
     """Re-derive per-hour effective params from the scenario + applied directives."""
     battery = inp["battery"]
-    capacity = float(battery["capacity"])
-    base_reserve = float(battery["minimum_energy"])
+    capacity = _bat(battery, "capacity_kwh", "capacity")
+    base_reserve = _bat(battery, "minimum_energy_kwh", "minimum_energy")
 
     by_hour = {int(r["hour"]): r for r in inp["hours"]}
     eff_solar = {h: float(by_hour[h]["solar_kwh"]) for h in range(HOURS)}
@@ -137,12 +146,12 @@ def _derive_params(inp: dict, directives: list[dict]):
                 eff_solar[h] *= float(adj["factor"])
         elif dtype == "minimum_battery_reserve":
             for h in hrs:
-                reserve[h] = max(reserve[h], float(adj["reserve"]))
-        elif dtype == "no_charge":
+                reserve[h] = max(reserve[h], float(adj["minimum_energy_kwh"]))
+        elif dtype == "no_charge_window":
             no_charge.update(hrs)
-        elif dtype == "no_discharge":
+        elif dtype == "no_discharge_window":
             no_discharge.update(hrs)
-        elif dtype == "max_grid":
+        elif dtype == "max_grid_window":
             cap = float(adj["max_grid_kwh"])
             for h in hrs:
                 grid_cap[h] = min(grid_cap.get(h, cap), cap)
@@ -166,10 +175,10 @@ def replay_plan(inp: dict, response: dict) -> list[str]:
     plan_by_hour = {int(p["hour"]): p for p in plan}
 
     battery = inp["battery"]
-    capacity = float(battery["capacity"])
-    initial = float(battery["initial_energy"])
-    max_charge = float(battery["max_charge"])
-    max_discharge = float(battery["max_discharge"])
+    capacity = _bat(battery, "capacity_kwh", "capacity")
+    initial = _bat(battery, "initial_energy_kwh", "initial_energy")
+    max_charge = _bat(battery, "max_charge_kwh_per_hour", "max_charge")
+    max_discharge = _bat(battery, "max_discharge_kwh_per_hour", "max_discharge")
     by_hour = {int(r["hour"]): r for r in inp["hours"]}
 
     directives = response.get("directive_interpretation", [])
@@ -275,7 +284,8 @@ def _norm_directive(d: dict) -> tuple:
                 return round(float(d[k]), 6)
         return None
 
-    return (dtype, hours_t, num("factor"), num("reserve"), num("max_grid_kwh"))
+    return (dtype, hours_t, num("factor"),
+            num("minimum_energy_kwh", "reserve"), num("max_grid_kwh"))
 
 
 def compare_directives(actual: list[dict], expected_output) -> list[str]:

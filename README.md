@@ -54,7 +54,7 @@ POST /optimize-energy
 
 **Why guardrails between the LLM and the optimizer?** The LLM output is treated
 as untrusted. Guardrails validate every field (directive type in the allowed
-set, hours as unique ints 0–23, `factor ∈ [0,1]`, `reserve ∈ [0, capacity]`,
+set, hours as unique ints 0–23, `factor ∈ [0,1]`, `minimum_energy_kwh ∈ [0, capacity]`,
 `max_grid_kwh ≥ 0`) and coerce any malformed or unsupported entry into an inert
 `no_op` instead of failing or inventing behavior. The optimizer only ever sees
 clean, typed directives, and the LP itself is what the judge independently
@@ -62,14 +62,14 @@ replays.
 
 ### The six directive types
 
-| directive_type            | structured_adjustment          | Effect in the LP                                    |
-|---------------------------|--------------------------------|-----------------------------------------------------|
-| `solar_reduction`         | `{hours, factor}` (0–1)        | `effective_solar[h] *= factor`                      |
-| `minimum_battery_reserve` | `{hours, reserve}` (≤ capacity)| raise SoC floor: `after[h] ≥ max(base, reserve)`    |
-| `no_charge`               | `{hours}`                      | `charge[h] = 0`                                      |
-| `no_discharge`            | `{hours}`                      | `discharge[h] = 0`                                   |
-| `max_grid`                | `{hours, max_grid_kwh}`        | `grid[h] ≤ max_grid_kwh`                             |
-| `no_op`                   | `null`                         | none (note carried no actionable instruction)       |
+| directive_type            | structured_adjustment                    | Effect in the LP                                    |
+|---------------------------|------------------------------------------|-----------------------------------------------------|
+| `solar_reduction`         | `{hours, factor}` (0–1)                  | `effective_solar[h] *= factor`                      |
+| `minimum_battery_reserve` | `{hours, minimum_energy_kwh}` (≤ capacity)| raise SoC floor: `after[h] ≥ max(base, minimum_energy_kwh)` |
+| `no_charge_window`        | `{hours}`                                | `charge[h] = 0`                                     |
+| `no_discharge_window`     | `{hours}`                                | `discharge[h] = 0`                                  |
+| `max_grid_window`         | `{hours, max_grid_kwh}`                  | `grid[h] ≤ max_grid_kwh`                            |
+| `no_op`                   | `null`                                   | none (note carried no actionable instruction)      |
 
 ## Local quickstart
 
@@ -99,12 +99,22 @@ uv run uvicorn core.asgi:application --host 0.0.0.0 --port 8000
 | `DEBUG`                 | no       | `True`/`False` (default `False`).                              |
 | `ALLOWED_HOSTS`         | no       | Comma-separated hosts.                                         |
 | `DATABASE_URL`          | no       | Postgres DSN. Absent → SQLite; `/health` needs no DB.          |
-| `LLM_PROVIDER`          | yes      | LLM provider, e.g. `gemini` or `openai`.                       |
-| `LLM_MODEL`             | yes      | Primary model id.                                              |
-| `LLM_MODEL_FALLBACK`    | no       | Model tried if the primary call fails.                         |
-| `LLM_API_KEY`           | yes      | API key (or `<PROVIDER>_API_KEY`, e.g. `OPENAI_API_KEY`).      |
+| `LLM_PROVIDER`          | yes      | Primary provider alias (`gemini`; see `LLM_PRIMARY_PROVIDER`). |
+| `LLM_PRIMARY_PROVIDER`  | no       | Primary LLM (`gemini`, default).                               |
+| `LLM_PRIMARY_MODEL`     | no       | Primary model (falls back to `LLM_MODEL`).                     |
+| `LLM_MODEL`             | yes      | Gemini model id.                                               |
+| `LLM_MODEL_FALLBACK`    | no       | Second Gemini model if the primary model overloads (503).      |
+| `LLM_API_KEY`           | yes*     | Gemini key(s), comma-separated.                                |
+| `GEMINI_API_KEY`        | no       | Alias for Gemini key.                                          |
+| `LLM_FALLBACK_PROVIDER` | no      | Backup provider (`openrouter`, default).                       |
+| `LLM_FALLBACK_MODEL`    | no       | OpenRouter model (`~deepseek/deepseek-flash-latest`).          |
+| `OPENROUTER_API_KEY`    | no**     | OpenRouter key (used only if Gemini fails).                    |
 | `LLM_BASE_URL`          | no       | OpenAI-compatible base URL (auto-set for `gemini`).            |
-| `LLM_TIMEOUT`           | no       | Per-call timeout seconds (default `8`, inside a 30s budget).   |
+| `LLM_TIMEOUT_SECONDS`   | no       | Per-provider attempt timeout (default `10`).                   |
+| `LLM_TIMEOUT`           | no       | Legacy alias for timeout seconds.                              |
+
+\* Required for Gemini unless fallback alone is acceptable in dev.  
+\** Required for OpenRouter fallback when Gemini is unavailable.
 
 ## Model / provider and how to switch
 
@@ -112,25 +122,21 @@ The LLM layer speaks the **OpenAI-compatible** Chat Completions API, so any
 provider exposing that surface works by setting env vars only — no code change.
 
 ```bash
-# Google Gemini (default in this repo)
-LLM_PROVIDER=gemini
-LLM_MODEL=gemini-3.8-flash
-LLM_MODEL_FALLBACK=gemini-3.6-flash
+# Google Gemini (primary) + OpenRouter DeepSeek (provider fallback)
+LLM_PRIMARY_PROVIDER=gemini
+LLM_PRIMARY_MODEL=gemini-3.6-flash
+LLM_MODEL=gemini-3.6-flash
+LLM_FALLBACK_PROVIDER=openrouter
+LLM_FALLBACK_MODEL=~deepseek/deepseek-flash-latest
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-LLM_API_KEY=<your-key>
-
-# OpenAI
-LLM_PROVIDER=openai
-LLM_MODEL=gpt-4o-mini
-LLM_BASE_URL=            # leave blank; SDK default
-LLM_API_KEY=<your-key>
+LLM_API_KEY=<gemini-key>
+OPENROUTER_API_KEY=<openrouter-key>
+LLM_TIMEOUT_SECONDS=10
 ```
 
-Notes are interpreted in JSON mode at `temperature=0` with three few-shot
-examples. If the primary model errors or times out, `LLM_MODEL_FALLBACK` is
-tried once.
-
 ## API examples
+
+The API is documented via OpenAPI 3. You can browse the interactive documentation at `/api/docs/` (Swagger UI) or `/api/redoc/` (ReDoc). These are optional convenience surfaces; judging uses the contract in the Problem Statement.
 
 ### `GET /health`
 
@@ -170,8 +176,8 @@ Response (abridged):
   "directive_interpretation": [
     {"note_index": 0, "applies": true, "directive_type": "solar_reduction",
      "structured_adjustment": {"hours": [12, 13], "factor": 0.5}},
-    {"note_index": 1, "applies": true, "directive_type": "no_charge",
-     "structured_adjustment": {"hours": [17, 18, 19, 20, 21]}},
+    {"note_index": 1, "applies": true, "directive_type": "no_charge_window",
+     "structured_adjustment": {"hours": [17, 18, 19, 20]}},
     {"note_index": 2, "applies": false, "directive_type": "no_op",
      "structured_adjustment": null}
   ],
@@ -203,16 +209,15 @@ secrets, never crashes).
 Everything is engineered to stay up within a **30s/request** budget and target
 **≤5s p95**, and to protect interpretation quality when the LLM is slow or flaky:
 
-- **Hard timeout + one retry + deadline.** Each provider call has a hard
-  per-attempt timeout (`LLM_TIMEOUT`); transient errors (timeout, `429`, `5xx`)
-  are retried up to `LLM_MAX_RETRIES`, and an optional `LLM_MODEL_FALLBACK` model
-  is tried — all bounded by an overall `LLM_DEADLINE` well under 30s. Final
-  failure raises a typed `LLMError` (never a crash).
-- **Deterministic fallback** (`gridwise/fallback.py`). Used **only** on
-  `LLMError`: a keyword/clock/number rule interpreter that still yields a valid
-  schedule, so a provider outage degrades gracefully instead of 500-ing. The LLM
-  remains the primary path; `fallback_used` is recorded in the logs. No public
-  note wording is hard-coded — it is generic keyword parsing.
+- **Provider fallback (Gemini → OpenRouter).** One controlled attempt on Gemini
+  (with optional comma-separated key rotation on auth/`429`). On any provider
+  failure — missing key, auth, quota/`429`, timeout, network, `5xx`, malformed
+  JSON, or schema validation failure — OpenRouter DeepSeek is called **once**
+  with the **same prompt and JSON schema**. Valid `no_op` results never trigger
+  fallback. Successful Gemini responses never call OpenRouter.
+- **Deterministic keyword fallback** (`gridwise/fallback.py`). Used **only** when
+  **both** LLM providers raise `LLMError`: keyword/clock parsing still yields a
+  valid schedule (`fallback_used=true` in logs).
 - **In-memory cache** keyed by the exact `operator_notes` list, cutting p95 for
   repeated interpretations (`LLM_CACHE_SIZE` entries, thread-safe LRU).
 - **Structured logging** of `scenario_id`, `path`, `status`, `latency_ms`,
@@ -224,8 +229,8 @@ Everything is engineered to stay up within a **30s/request** budget and target
 POSTs `input` to a running server, then **independently re-derives** every
 constraint and verifies the returned `hourly_plan`: 24 unique hours; per-hour
 energy balance within 0.01; `solar_used ≤ effective solar`; battery bounds,
-rate limits, state transitions and active reserve; `no_charge` / `no_discharge`
-/ `max_grid` obeyed; end-of-day battery = initial; and reported totals match the
+rate limits, state transitions and active reserve; `no_charge_window` /
+`no_discharge_window` / `max_grid_window` obeyed; end-of-day battery = initial; and reported totals match the
 plan. It also compares `directive_interpretation` (type + hours + numeric
 values, ignoring free-text) against each case's `expected_output`.
 
@@ -304,8 +309,8 @@ heroku config:set -a your-app \
   SECRET_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(50))')" \
   DEBUG=False \
   ALLOWED_HOSTS="your-app.herokuapp.com" \
-  LLM_PROVIDER=gemini LLM_MODEL=gemini-3.8-flash \
-  LLM_MODEL_FALLBACK=gemini-3.6-flash \
+  LLM_PROVIDER=gemini LLM_MODEL=gemini-3.6-flash \
+  LLM_MODEL_FALLBACK=gemini-3.8-flash \
   LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/" \
   LLM_API_KEY="<your-key>"
 git push heroku main          # builds Dockerfile; release runs migrate + seed
@@ -361,7 +366,7 @@ docker build -t gridwise-web:latest .
 docker run --rm -p 8000:8000 \
   -e SECRET_KEY=change-me \
   -e SECURE_SSL_REDIRECT=False \
-  -e LLM_PROVIDER=gemini -e LLM_MODEL=gemini-3.8-flash \
+  -e LLM_PROVIDER=gemini -e LLM_MODEL=gemini-3.6-flash \
   -e LLM_API_KEY=<your-key> \
   gridwise-web:latest
 

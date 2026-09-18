@@ -25,10 +25,17 @@ services:
       # For the postgres profile, set DATABASE_URL (see the example below).
       DATABASE_URL: ${DATABASE_URL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
-      LLM_MODEL: ${LLM_MODEL:-gemini-3.8-flash}
-      LLM_MODEL_FALLBACK: ${LLM_MODEL_FALLBACK:-gemini-3.6-flash}
+      LLM_PRIMARY_PROVIDER: ${LLM_PRIMARY_PROVIDER:-gemini}
+      LLM_PRIMARY_MODEL: ${LLM_PRIMARY_MODEL:-${LLM_MODEL:-gemini-3.6-flash}}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3.6-flash}
+      LLM_MODEL_FALLBACK: ${LLM_MODEL_FALLBACK:-gemini-3.8-flash}
       LLM_API_KEY: ${LLM_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-openrouter}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-~deepseek/deepseek-flash-latest}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-10}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-8}
     restart: unless-stopped
 

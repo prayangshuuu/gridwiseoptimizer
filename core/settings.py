@@ -32,7 +32,8 @@ SECRET_KEY = env('SECRET_KEY', default='django-insecure-default-change-me')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env.bool('DEBUG', default=False)
 
-ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['*'])
+PORT = env.int('PORT', default=8000)
 CSRF_TRUSTED_ORIGINS = env.list('CSRF_TRUSTED_ORIGINS', default=[])
 
 
@@ -47,6 +48,8 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'drf_spectacular',
+    'drf_spectacular_sidecar',
     'gridwise',
     'allauth',
     'allauth.account',
@@ -125,12 +128,15 @@ EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': env.db(
-        'DATABASE_URL',
-        default=f'sqlite:///{BASE_DIR / "db.sqlite3"}'
-    )
-}
+# If DATABASE_URL is explicitly set, use it.
+# If not, use an empty dictionary (no DB) to ensure the judging path works without a DB.
+_db_url = env('DATABASE_URL', default=None)
+if _db_url:
+    DATABASES = {
+        'default': env.db('DATABASE_URL')
+    }
+else:
+    DATABASES = {}
 
 
 # Password validation
@@ -193,6 +199,26 @@ if not DEBUG:
     SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True)
     SECURE_HSTS_PRELOAD = env.bool('SECURE_HSTS_PRELOAD', default=True)
 
+# DRF Config
+# Do NOT set a global DEFAULT_PERMISSION_CLASSES of IsAuthenticated
+# Keep DRF defaults permissive (AllowAny by default) and let each view declare its own.
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'GridWise Energy Optimization API',
+    'DESCRIPTION': 'API for optimizing microgrid energy dispatch and interpreting operator notes.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SWAGGER_UI_DIST': 'SIDECAR',
+    'SWAGGER_UI_FAVICON_HREF': 'SIDECAR',
+    'REDOC_DIST': 'SIDECAR',
+}
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -209,6 +235,13 @@ LOGGING = {
         'django': {
             'handlers': ['console'],
             'level': env('DJANGO_LOG_LEVEL', default='INFO'),
+            'propagate': False,
+        },
+        # Emit the API's structured request logs (scenario_id, path, latency_ms,
+        # fallback_used) and LLM retry/fallback warnings to stdout.
+        'gridwise': {
+            'handlers': ['console'],
+            'level': env('GRIDWISE_LOG_LEVEL', default='INFO'),
             'propagate': False,
         },
     },

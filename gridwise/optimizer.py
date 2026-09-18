@@ -67,23 +67,30 @@ def _apply_directives(directives, base_solar, base_reserve, capacity):
     grid_cap: list[float | None] = [None] * HOURS
 
     for d in directives:
+        # Read the validated payload from structured_adjustment (see
+        # gridwise.guardrails.Directive). Only applicable, cleaned entries reach
+        # here; hours are already unique ints in 0..23.
         if not d.applies:
             continue
+        adj = d.structured_adjustment or {}
+        hours = adj.get("hours", [])
         if d.directive_type == "solar_reduction":
-            for h in d.hours:
-                effective_solar[h] *= d.factor
+            factor = adj.get("factor", 1.0)
+            for h in hours:
+                effective_solar[h] *= factor
         elif d.directive_type == "minimum_battery_reserve":
-            for h in d.hours:
-                reserve[h] = max(reserve[h], d.reserve)
-        elif d.directive_type == "no_charge":
-            for h in d.hours:
+            floor = adj.get("minimum_energy_kwh", 0.0)
+            for h in hours:
+                reserve[h] = max(reserve[h], floor)
+        elif d.directive_type == "no_charge_window":
+            for h in hours:
                 no_charge[h] = True
-        elif d.directive_type == "no_discharge":
-            for h in d.hours:
+        elif d.directive_type == "no_discharge_window":
+            for h in hours:
                 no_discharge[h] = True
-        elif d.directive_type == "max_grid":
-            for h in d.hours:
-                cap = d.max_grid_kwh
+        elif d.directive_type == "max_grid_window":
+            cap = adj.get("max_grid_kwh")
+            for h in hours:
                 grid_cap[h] = cap if grid_cap[h] is None else min(grid_cap[h], cap)
 
     # A reserve can never exceed capacity in the model; clamp to keep feasible

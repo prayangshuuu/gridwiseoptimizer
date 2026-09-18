@@ -8,6 +8,7 @@
 <body>
     <nav>
         <a href="/">Home</a>
+        <a href="{% url 'swagger-ui' %}">API Docs</a>
         {% if user.is_authenticated %}
             <a href="{% url 'users:profile' %}">Profile</a>
             <form method="POST" action="{% url 'account_logout' %}" style="display:inline;">

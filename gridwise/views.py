@@ -10,11 +10,12 @@ from rest_framework import status
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
-from .serializers import OptimizeEnergyRequestSerializer
-from .llm import interpret_notes, LLMError
+from .serializers import OptimizeEnergyRequestSerializer, OptimizeEnergyResponseSerializer
+from .llm import interpret_notes, LLMError, get_last_provider_used
 from .fallback import interpret_notes_fallback
-from .guardrails import validate_directives, GuardrailError
+from .guardrails import validate_directives, to_interpretation
 from .optimizer import optimize, OptimizerError
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,15 @@ class GridwiseBaseAPIView(APIView):
 
 
 class HealthCheckView(GridwiseBaseAPIView):
+    @extend_schema(
+        summary="Readiness check",
+        responses={
+            200: OpenApiResponse(
+                description="Success",
+                examples=[OpenApiExample("Success", value={"status": "ok"})]
+            )
+        }
+    )
     def get(self, request):
         return Response({"status": "ok"}, status=status.HTTP_200_OK)
 
@@ -71,6 +81,66 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
       - 200 with the plan otherwise (possibly via the deterministic fallback).
     """
 
+    @extend_schema(
+        request=OptimizeEnergyRequestSerializer,
+        responses={
+            200: OptimizeEnergyResponseSerializer,
+            400: OpenApiResponse(description="Malformed JSON"),
+            422: OpenApiResponse(description="Semantically invalid"),
+            500: OpenApiResponse(description="Controlled internal error")
+        },
+        examples=[
+            OpenApiExample(
+                "Realistic Example",
+                request_only=True,
+                value={
+                    "scenario_id": "test-123",
+                    "operator_notes": [
+                        "Keep reserve at 20kWh",
+                        "No charging between 18:00 and 21:00",
+                        "Weather looks nice today"
+                    ],
+                    "hours": [
+                        {"hour": i, "demand_kwh": 50.0, "solar_kwh": 20.0, "tariff_bdt_per_kwh": 5.5} for i in range(24)
+                    ],
+                    "battery": {
+                        "capacity": 100.0,
+                        "initial_energy": 50.0,
+                        "minimum_energy": 10.0,
+                        "max_charge": 30.0,
+                        "max_discharge": 30.0
+                    }
+                }
+            ),
+            OpenApiExample(
+                "Realistic Example",
+                response_only=True,
+                value={
+                    "scenario_id": "test-123",
+                    "directive_interpretation": [
+                        {"directive_type": "minimum_battery_reserve", "minimum_energy_kwh": 20.0},
+                        {"directive_type": "no_charge_window", "hours": [18, 19, 20]},
+                        {"directive_type": "no_op"}
+                    ],
+                    "hourly_plan": [
+                        {
+                            "hour": i,
+                            "demand_kwh": 50.0,
+                            "solar_kwh": 20.0,
+                            "battery_action": "idle",
+                            "battery_kwh": 0.0,
+                            "grid_kwh": 30.0,
+                            "state_of_charge_kwh": 50.0
+                        } for i in range(24)
+                    ],
+                    "total_grid_kwh": 720.0,
+                    "total_cost_bdt": 3960.0,
+                    "peak_grid_kwh": 30.0,
+                    "plan_summary": "Imports 720.00 kWh from grid at 3960.00 BDT; peak 30.00 kWh at hour 0. Battery charges in 0 hour(s), discharges in 0 hour(s)."
+                }
+            )
+        ]
+    )
     def post(self, request):
         started = time.monotonic()
         path = request.path
@@ -115,7 +185,8 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
         self._log_run(validated, response_body)
 
         _log_event(scenario_id=scenario_id, path=path, status=200,
-                   latency_ms=_ms(started), fallback_used=fallback_used)
+                   latency_ms=_ms(started), fallback_used=fallback_used,
+                   llm_provider=llm_provider if not fallback_used else "deterministic")
         return Response(response_body, status=status.HTTP_200_OK)
 
     def _run_pipeline(self, validated: dict) -> tuple[dict, bool]:
@@ -126,15 +197,18 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
         # LLM stays the primary path; the deterministic interpreter is the
         # safety net used ONLY when the LLM call finally fails.
         fallback_used = False
+        llm_provider = None
         try:
             raw = interpret_notes(notes)
+            llm_provider = get_last_provider_used()
         except LLMError as exc:
             logger.warning("LLM interpretation failed; using fallback: %s", exc)
             raw = interpret_notes_fallback(notes)
             fallback_used = True
+            llm_provider = None
 
         directives = validate_directives(
-            raw, num_notes=len(notes), capacity=float(battery["capacity"])
+            raw, num_notes=len(notes), battery=battery
         )
         plan = optimize(hours, battery, directives)
 
@@ -151,7 +225,7 @@ class OptimizeEnergyView(GridwiseBaseAPIView):
 
         return {
             "scenario_id": validated["scenario_id"],
-            "directive_interpretation": [d.to_dict() for d in directives],
+            "directive_interpretation": [to_interpretation(d) for d in directives],
             "hourly_plan": plan,
             "total_grid_kwh": round(total_grid_kwh, 6),
             "total_cost_bdt": round(total_cost_bdt, 6),

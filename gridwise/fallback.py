@@ -17,11 +17,16 @@ import re
 # Directive detection keywords (generic, not case-specific).
 _SOLAR_WORDS = ("solar", "pv", "photovoltaic", "sun")
 _REDUCE_WORDS = ("cut", "reduce", "reduction", "lower", "drop", "derate",
-                 "decrease", "less", "down", "scale", "curtail", "de-rate")
+                 "decrease", "less", "down", "scale", "curtail", "de-rate",
+                 "leave", "only", "usable", "treat", "treated", "of the forecast",
+                 "of the predicted", "of the expected", "of the scheduled")
 _RESERVE_WORDS = ("reserve", "minimum", "at least", "floor", "keep", "maintain",
-                  "hold", "below", "no lower than", "don't let")
+                  "hold", "below", "no lower than", "don't let", "remain",
+                  "stored", "requires")
 _GRID_CAP_WORDS = ("cap", "limit", "ceiling", "no more than", "at most",
-                   "restrict", "max", "maximum", "not exceed")
+                   "restrict", "max", "maximum", "not exceed", "below",
+                   "under", "at or below", "stay at or below", "stay below",
+                   "stay under")
 
 # Words that map to explicit hour windows when no numeric clock is given.
 _NAMED_WINDOWS = {
@@ -31,6 +36,14 @@ _NAMED_WINDOWS = {
     "midday": (11, 14),
     "overnight": (0, 6),
     "night": (22, 24),
+    "all day": (0, 24),
+    "all-day": (0, 24),
+    "allday": (0, 24),
+    "24 hours": (0, 24),
+    "24-hour": (0, 24),
+    "24h": (0, 24),
+    "full day": (0, 24),
+    "the day": (0, 24),
 }
 
 
@@ -143,14 +156,38 @@ def _has(text: str, words) -> bool:
 
 def _negated_charge(text: str) -> bool:
     low = text.lower()
-    if any(p in low for p in ("do not", "don't", "dont", "no ", "avoid",
-                              "stop", "halt", "prevent", "without", "off")):
+    if any(p in low for p in ("do not", "don't", "dont", "no ",
+                              "avoid", "stop", "halt", "prevent", "without",
+                              "off", "block", "ban", "forbid", "restrict",
+                              "refuse", "must not", "isolated", "isolating",
+                              "unavailable", "disabled", "disable",
+                              "out of service", "offline", "not be", "cannot")):
         return True
     # "keep/prevent/stop the battery FROM (dis)charging"
-    return bool(re.search(r"\b(keep|prevent|stop|hold)\b[^.]*\bfrom\b[^.]*charg", low))
+    return bool(re.search(r"\b(keep|prevent|stop|hold|block|restrict|"
+                          r"disabled?|isolated?|unavailable|"
+                          r"forbidden?|not\s+be)\b[^.]*\b(from|to)\b[^.]*charg",
+                          low))
 
 
-def _interpret_one(note: str, index: int) -> dict:
+def _extract_kwh_for_reserve(text: str, capacity_kwh: float | None) -> float | None:
+    """Return kWh for a minimum_battery_reserve directive.
+
+    Prefers explicit ``kWh`` units; falls back to ``<pct>% of the battery
+    capacity`` when capacity is known. Returns None when neither can be
+    resolved (caller decides no_op vs other directive)."""
+    kwh = _extract_number(text, r"(?:kwh|kw|kilowatt(?:-?hours?)?)")
+    if kwh is not None:
+        return kwh
+    if capacity_kwh and capacity_kwh > 0:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent)\s*(?:of\s*(?:the\s*)?"
+                      r"(?:battery|capacity|pack))?", text, re.IGNORECASE)
+        if m:
+            return round(capacity_kwh * float(m.group(1)) / 100.0, 6)
+    return None
+
+
+def _interpret_one(note: str, index: int, battery: dict | None = None) -> dict:
     low = note.lower()
     hours = parse_hours(note)
 
@@ -168,11 +205,17 @@ def _interpret_one(note: str, index: int) -> dict:
 
     # discharge before charge ("discharge" contains "charge").
     if "discharg" in low and _negated_charge(low):
-        return result(True, "no_discharge", {"hours": hours}) if hours else no_op()
+        return result(True, "no_discharge_window", {"hours": hours}) if hours else no_op()
     if "charg" in low and _negated_charge(low):
-        return result(True, "no_charge", {"hours": hours}) if hours else no_op()
+        return result(True, "no_charge_window", {"hours": hours}) if hours else no_op()
 
     if _has(low, _SOLAR_WORDS) and _has(low, _REDUCE_WORDS):
+        if hours:
+            return result(True, "solar_reduction",
+                          {"hours": hours, "factor": _solar_factor(note)})
+        return no_op()
+    # A percentage attached to solar without a reduce verb is still a reduction.
+    if _has(low, _SOLAR_WORDS) and re.search(r"\d+(?:\.\d+)?\s*(?:%|percent)", low):
         if hours:
             return result(True, "solar_reduction",
                           {"hours": hours, "factor": _solar_factor(note)})
@@ -180,19 +223,27 @@ def _interpret_one(note: str, index: int) -> dict:
 
     kwh = _extract_number(low, r"(?:kwh|kw|kilowatt(?:-?hours?)?)")
     if "grid" in low and _has(low, _GRID_CAP_WORDS) and kwh is not None:
-        return result(True, "max_grid",
+        return result(True, "max_grid_window",
                       {"hours": hours, "max_grid_kwh": kwh}) if hours else no_op()
 
-    if _has(low, _RESERVE_WORDS) and kwh is not None and (
+    capacity = (battery or {}).get("capacity") if isinstance(battery, dict) else None
+    reserve_kwh = _extract_kwh_for_reserve(note, capacity)
+    if _has(low, _RESERVE_WORDS) and reserve_kwh is not None and (
         "batter" in low or "reserve" in low or "charge" in low or "soc" in low
+        or "capacity" in low or "data center" in low or "emergency" in low
     ):
         return result(True, "minimum_battery_reserve",
-                      {"hours": hours, "reserve": kwh}) if hours else no_op()
+                      {"hours": hours, "minimum_energy_kwh": reserve_kwh}) if hours else no_op()
 
     return no_op()
 
 
-def interpret_notes_fallback(operator_notes) -> list[dict]:
+def interpret_notes_fallback(operator_notes, battery: dict | None = None) -> list[dict]:
     """Deterministic interpretation of notes. Never raises; returns one raw
-    object per note in order, in the same shape as the LLM interpreter."""
-    return [_interpret_one(str(note), i) for i, note in enumerate(operator_notes)]
+    object per note in order, in the same shape as the LLM interpreter.
+
+    ``battery`` is optional but, when provided, lets the interpreter resolve
+    ``"<pct>% of the battery capacity"`` style directives into kWh.
+    """
+    return [_interpret_one(str(note), i, battery=battery)
+            for i, note in enumerate(operator_notes)]

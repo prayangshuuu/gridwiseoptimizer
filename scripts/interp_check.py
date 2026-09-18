@@ -22,7 +22,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-NUM_KEYS = ("factor", "reserve", "max_grid_kwh")
 LARGE_CAPACITY = 1e9  # so reserve bounds never coerce a test directive
 
 
@@ -41,23 +40,24 @@ def _load_dotenv() -> None:
             os.environ[key] = val
 
 
-def _sig(directive_type, hours, factor=None, reserve=None, max_grid_kwh=None):
+def _sig(directive_type, hours, factor=None, minimum_energy_kwh=None, max_grid_kwh=None):
     hrs = tuple(sorted(int(h) for h in (hours or [])))
     nums = tuple(None if v is None else round(float(v), 6)
-                 for v in (factor, reserve, max_grid_kwh))
+                 for v in (factor, minimum_energy_kwh, max_grid_kwh))
     return (directive_type, hrs, *nums)
 
 
 def _expected_sig(exp: dict):
     return _sig(exp.get("directive_type"), exp.get("hours"),
-                exp.get("factor"), exp.get("reserve"), exp.get("max_grid_kwh"))
+                exp.get("factor"), exp.get("minimum_energy_kwh"), exp.get("max_grid_kwh"))
 
 
 def _actual_sig(directive) -> tuple:
-    d = directive.to_dict()
+    from gridwise.guardrails import to_interpretation
+    d = to_interpretation(directive)
     adj = d.get("structured_adjustment") or {}
     return _sig(d.get("directive_type"), adj.get("hours"),
-                adj.get("factor"), adj.get("reserve"), adj.get("max_grid_kwh"))
+                adj.get("factor"), adj.get("minimum_energy_kwh"), adj.get("max_grid_kwh"))
 
 
 def main() -> int:
@@ -73,7 +73,11 @@ def main() -> int:
     import json
     import time
     from gridwise.llm import interpret_notes, LLMError, clear_cache
-    from gridwise.guardrails import validate_directives, GuardrailError
+    from gridwise.guardrails import validate_directives
+
+    # A battery with effectively unbounded capacity so reserve bounds never
+    # coerce a test directive; guardrails reads .capacity_kwh / ["capacity"].
+    battery = {"capacity_kwh": LARGE_CAPACITY}
 
     path = Path(args.file)
     if not path.is_file():
@@ -101,8 +105,8 @@ def main() -> int:
         try:
             raw = interpret_notes(notes)
             directives = validate_directives(raw, num_notes=len(notes),
-                                             capacity=LARGE_CAPACITY)
-        except (LLMError, GuardrailError) as e:
+                                             battery=battery)
+        except LLMError as e:
             detail = f"{type(e).__name__}: {str(e)[:60]}"
             print(f"{name.ljust(name_w)}  FAIL    {detail}")
             for exp in expected:
