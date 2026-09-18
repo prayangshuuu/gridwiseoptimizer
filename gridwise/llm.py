@@ -28,12 +28,11 @@ import os
 #   Absolute set-points (e.g. a battery reserve floor) use `value` in kWh.
 # ---------------------------------------------------------------------------
 DIRECTIVE_TYPES = (
-    "solar_reduction",      # scale solar_kwh in the given hours by `factor`
-    "demand_adjustment",    # scale demand_kwh in the given hours by `factor`
-    "tariff_adjustment",    # scale tariff_bdt_per_kwh in the given hours by `factor`
-    "battery_reserve",      # set minimum battery energy floor to `value` kWh
-    "charge_window",        # allow/deny battery charging in the given hours
-    "discharge_window",     # allow/deny battery discharging in the given hours
+    "solar_reduction",          # scale solar_kwh in the given hours by `factor` (0..1)
+    "minimum_battery_reserve",  # raise the battery energy floor to `reserve` kWh
+    "no_charge",                # forbid battery charging in the given hours
+    "no_discharge",             # forbid battery discharging in the given hours
+    "max_grid",                 # cap grid import to `max_grid_kwh` in the given hours
 )
 
 
@@ -79,20 +78,24 @@ Each result object has exactly these fields:
   - "applies": boolean, true only if the note is an actionable directive.
   - "directive_type": one of {list(DIRECTIVE_TYPES)} when applies is true,
     otherwise the string "no_op".
-  - "structured_adjustment": object describing the change (see rules), or {{}}
-    when applies is false.
+  - "structured_adjustment": object describing the change (see rules) when
+    applies is true, or null when applies is false.
   - "explanation": a one-sentence justification grounded in the note text.
 
 Rules:
-  - Whole-hour rule: hour references are integers 0..23 in an "hours" array.
-    Convert clock times to hour indices (e.g. "noon to 4pm" -> [12,13,14,15,16]).
-  - Factor rule: proportional changes use "factor", a non-negative multiplier
-    (0.7 = reduce 30%, 1.2 = increase 20%, 0 = off). Absolute set-points use
-    "value" in kWh (used by battery_reserve).
-  - charge_window / discharge_window carry "hours" plus a boolean "allow".
-  - Only use a directive_type from the allowed list. If a note is small talk,
-    a status update, or otherwise not actionable, set applies=false,
-    directive_type="no_op", structured_adjustment={{}}.
+  - Whole-hour rule: hour references are integers 0..23 in an "hours" array,
+    unique and ascending. Convert clock times to hour indices
+    (e.g. "noon to 4pm" -> [12,13,14,15,16]; "6pm to 9pm" -> [18,19,20,21]).
+  - Structured_adjustment shape per directive_type:
+      solar_reduction:         {{"hours": [...], "factor": <0..1>}}
+        factor is the FRACTION REMAINING (0.7 == "cut 30%", 0 == "no solar").
+      minimum_battery_reserve: {{"hours": [...], "reserve": <kWh >= 0>}}
+      no_charge:               {{"hours": [...]}}
+      no_discharge:            {{"hours": [...]}}
+      max_grid:                {{"hours": [...], "max_grid_kwh": <kWh >= 0>}}
+  - Only use a directive_type from the allowed list. If a note is small talk, a
+    status update, or otherwise not actionable, set applies=false,
+    directive_type="no_op", structured_adjustment=null.
   - Output JSON only. Do not invent hours or numbers not implied by the note.
 """
 
@@ -117,15 +120,15 @@ FEWSHOT_ASSISTANT = json.dumps({
         {
             "note_index": 1,
             "applies": True,
-            "directive_type": "charge_window",
-            "structured_adjustment": {"hours": [18, 19, 20, 21], "allow": False},
+            "directive_type": "no_charge",
+            "structured_adjustment": {"hours": [18, 19, 20, 21]},
             "explanation": "Battery charging is disallowed during the 6-9pm peak.",
         },
         {
             "note_index": 2,
             "applies": False,
             "directive_type": "no_op",
-            "structured_adjustment": {},
+            "structured_adjustment": None,
             "explanation": "The note is a thank-you message with no actionable directive.",
         },
     ]
