@@ -1,0 +1,54 @@
+# Web + OPTIONAL Postgres.
+#
+#   docker compose up --build                 # web only; /health works, no DB
+#   docker compose --profile postgres up --build   # web + Postgres
+#
+# Postgres lives behind the "postgres" profile so it is not started by default.
+# The web service has no hard dependency on it: /health has no DB dependency,
+# and migrations run only when DATABASE_URL is set (see docker-entrypoint.sh).
+#
+# Secrets are read from the shell / a local .env via ${VAR} substitution; none
+# are committed here. Provide LLM_API_KEY at run time.
+
+services:
+  web:
+    build: .
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:-docker-dev-insecure-key}
+      DEBUG: ${DEBUG:-False}
+      # Allow plain-HTTP access to /health when running the container directly.
+      SECURE_SSL_REDIRECT: "False"
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,0.0.0.0}
+      # Empty by default => no migrations, SQLite fallback, /health without DB.
+      # For the postgres profile, set DATABASE_URL (see the example below).
+      DATABASE_URL: ${DATABASE_URL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3.8-flash}
+      LLM_MODEL_FALLBACK: ${LLM_MODEL_FALLBACK:-gemini-3.6-flash}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-8}
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${DB_PORT:-5435}:5432"
+
+volumes:
+  postgres_data:

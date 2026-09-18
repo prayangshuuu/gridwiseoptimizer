@@ -12,8 +12,15 @@ against the actual scenario. Do not act on this output directly.
 """
 from __future__ import annotations
 
+import collections
+import copy
 import json
+import logging
 import os
+import threading
+import time
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Directive contract shared with the prompt below.
@@ -21,11 +28,12 @@ import os
 # There are exactly six directive types the model may emit when a note applies.
 # A note that carries no actionable instruction is a `no_op` (applies=False).
 #
-# Whole-hour rule: every hour reference is an integer in 0..23 (no partial
-#   hours, no ranges other than an explicit list of hour indices).
-# Factor rule: proportional changes are expressed as a non-negative multiplier
-#   in `factor` (0.7 == "reduce by 30%", 1.2 == "increase by 20%", 0 == "off").
-#   Absolute set-points (e.g. a battery reserve floor) use `value` in kWh.
+# Whole-hour rule: every hour reference is an integer in 0..23. A range
+#   "A to B" / "A-B" / "between A and B" covers hour A up to but NOT including
+#   hour B (endpoint-exclusive; B is the stop time). This same convention is
+#   mirrored in gridwise/fallback.py and tests/paraphrase_cases.json.
+# Factor rule (solar_reduction): `factor` is the FRACTION OF SOLAR REMAINING
+#   after the cut (0.7 == "cut 30%", 0.5 == "by half", 0 == "off").
 # ---------------------------------------------------------------------------
 DIRECTIVE_TYPES = (
     "solar_reduction",          # scale solar_kwh in the given hours by `factor` (0..1)
@@ -38,7 +46,43 @@ DIRECTIVE_TYPES = (
 
 class LLMError(Exception):
     """Raised when the LLM call fails (timeout, provider error, bad config,
-    or unparseable response). The caller decides how to surface it."""
+    or unparseable response). The caller decides how to surface it.
+
+    ``transient`` marks errors worth retrying (timeout, connection, 429, 5xx).
+    """
+
+    transient: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# In-memory interpretation cache, keyed by the exact operator_notes list.      #
+# Cutting repeat interpretations is the main p95 lever. Bounded LRU, guarded   #
+# by a lock for thread safety under the ASGI server.                           #
+# --------------------------------------------------------------------------- #
+_CACHE: "collections.OrderedDict[str, list]" = collections.OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str):
+    with _CACHE_LOCK:
+        if key in _CACHE:
+            _CACHE.move_to_end(key)
+            return copy.deepcopy(_CACHE[key])
+    return None
+
+
+def _cache_put(key: str, value, maxsize: int) -> None:
+    with _CACHE_LOCK:
+        _CACHE[key] = copy.deepcopy(value)
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > maxsize:
+            _CACHE.popitem(last=False)
+
+
+def clear_cache() -> None:
+    """Drop all cached interpretations (used by tests)."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 # Default OpenAI-compatible base URLs per provider. Overridden by LLM_BASE_URL.
@@ -83,23 +127,34 @@ Each result object has exactly these fields:
   - "explanation": a one-sentence justification grounded in the note text.
 
 Rules:
-  - Whole-hour rule: hour references are integers 0..23 in an "hours" array,
-    unique and ascending. Convert clock times to hour indices
-    (e.g. "noon to 4pm" -> [12,13,14,15,16]; "6pm to 9pm" -> [18,19,20,21]).
+  - Whole-hour rule: "hours" is an array of integer hour indices 0..23, unique
+    and ascending. Each index h is the slot [h:00, h+1:00).
+    INCLUSIVE/EXCLUSIVE: a range "A to B" / "A-B" / "between A and B" / "A
+    until/through B" covers hour A up to but NOT including hour B (B is the end
+    time). Examples: "noon to 4pm" -> [12,13,14,15]; "5pm to 9pm" ->
+    [17,18,19,20]; "09:00 to 13:00" -> [9,10,11,12]. A single time such as "at
+    3pm" or "the 15:00 hour" -> [15]. noon=12, midnight=0.
   - Structured_adjustment shape per directive_type:
       solar_reduction:         {{"hours": [...], "factor": <0..1>}}
-        factor is the FRACTION REMAINING (0.7 == "cut 30%", 0 == "no solar").
+        factor = FRACTION OF SOLAR REMAINING after the cut. "cut/reduce by 30%"
+        or "by 0.3" -> 0.7; "by half" -> 0.5; "to 70%" -> 0.7; "no solar"/"off"
+        -> 0. Never emit a factor above 1.
       minimum_battery_reserve: {{"hours": [...], "reserve": <kWh >= 0>}}
       no_charge:               {{"hours": [...]}}
       no_discharge:            {{"hours": [...]}}
       max_grid:                {{"hours": [...], "max_grid_kwh": <kWh >= 0>}}
-  - Only use a directive_type from the allowed list. If a note is small talk, a
-    status update, or otherwise not actionable, set applies=false,
-    directive_type="no_op", structured_adjustment=null.
-  - Output JSON only. Do not invent hours or numbers not implied by the note.
+  - no_op vs real: set no_op ONLY when the note carries no actionable energy
+    instruction (greetings, thanks, status updates, FYIs, reminders). If the
+    note names a concrete change to solar, battery charging/discharging, a
+    reserve floor, or a grid-import cap, it is NOT a no_op.
+  - Only use a directive_type from the allowed list. Output JSON only. Do not
+    invent hours or numbers that the note does not imply.
 """
 
-# 2-3 few-shot examples: a solar_reduction, a window directive, a no_op.
+# Generic few-shot examples (NOT copied from any public/judge cases): one
+# solar_reduction (factor=remaining), one window directive, one no_op. They also
+# demonstrate the endpoint-exclusive hour rule ("noon to 4pm" -> [12,13,14,15];
+# "6pm to 9pm" -> [18,19,20]).
 FEWSHOT_USER = json.dumps({
     "operator_notes": [
         "Heavy cloud cover this afternoon, cut expected solar by 30% from noon to 4pm.",
@@ -114,15 +169,15 @@ FEWSHOT_ASSISTANT = json.dumps({
             "note_index": 0,
             "applies": True,
             "directive_type": "solar_reduction",
-            "structured_adjustment": {"hours": [12, 13, 14, 15, 16], "factor": 0.7},
-            "explanation": "Cloud cover reduces solar output by 30% over noon-4pm.",
+            "structured_adjustment": {"hours": [12, 13, 14, 15], "factor": 0.7},
+            "explanation": "Cloud cover leaves 70% of solar over the noon-to-4pm window.",
         },
         {
             "note_index": 1,
             "applies": True,
             "directive_type": "no_charge",
-            "structured_adjustment": {"hours": [18, 19, 20, 21]},
-            "explanation": "Battery charging is disallowed during the 6-9pm peak.",
+            "structured_adjustment": {"hours": [18, 19, 20]},
+            "explanation": "Battery charging is disallowed across the 6-to-9pm peak.",
         },
         {
             "note_index": 2,
@@ -135,20 +190,48 @@ FEWSHOT_ASSISTANT = json.dumps({
 })
 
 
+def _is_transient(exc, openai_pkg) -> bool:
+    """Whether a raised SDK exception is worth retrying."""
+    if isinstance(exc, (openai_pkg.APITimeoutError, openai_pkg.APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and (status == 429 or status >= 500)
+
+
+def _llm_error(msg: str, transient: bool = False) -> LLMError:
+    """Build an LLMError tagged with whether it is worth retrying. Callers use
+    `raise _llm_error(...) from exc` to preserve the underlying cause."""
+    err = LLMError(msg)
+    err.transient = transient
+    return err
+
+
 def interpret_notes(operator_notes):
     """Interpret operator notes into raw structured directives via an LLM.
 
+    Reliability contract: results for an identical ``operator_notes`` list are
+    served from an in-memory cache; each provider call has a hard per-attempt
+    timeout; transient failures are retried up to LLM_MAX_RETRIES within an
+    overall LLM_DEADLINE budget; on final failure a typed :class:`LLMError` is
+    raised (never a crash) so the view can fall back deterministically.
+
     Args:
-        operator_notes: list[str] of 1-3 notes (already validated upstream).
+        operator_notes: list[str] of notes (already validated upstream).
 
     Returns:
         A list with one raw parsed object per note, in input order. The content
-        is UNTRUSTED and must be validated by the optimizer before use.
+        is UNTRUSTED and must be validated by the guardrails before use.
 
     Raises:
-        LLMError: on missing configuration, timeout, provider error, or a
-            response that is not parseable JSON in the expected shape.
+        LLMError: on missing configuration, exhausted retries/deadline, provider
+            error, or a response that is not parseable JSON.
     """
+    notes = list(operator_notes)
+    cache_key = json.dumps(notes, ensure_ascii=False, sort_keys=False)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     provider = _env("LLM_PROVIDER", "openai") or "openai"
     model = _env("LLM_MODEL")
     if not model:
@@ -156,61 +239,72 @@ def interpret_notes(operator_notes):
     fallback_model = _env("LLM_MODEL_FALLBACK")
 
     api_key = _resolve_api_key(provider)
-    # base_url from env, else a per-provider default (e.g. Gemini's gateway).
     base_url = _env("LLM_BASE_URL") or _PROVIDER_BASE_URLS.get(provider.lower())
-    # Short call timeout that stays well inside the 30s request budget.
-    try:
-        timeout = float(_env("LLM_TIMEOUT", "8") or "8")
-    except ValueError:
-        timeout = 8.0
+
+    def _float_env(name, default):
+        try:
+            return float(_env(name, str(default)) or default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _int_env(name, default):
+        try:
+            return int(float(_env(name, str(default)) or default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    timeout = _float_env("LLM_TIMEOUT", 8)          # hard per-attempt timeout (s)
+    max_retries = max(0, _int_env("LLM_MAX_RETRIES", 1))  # extra tries on transient
+    deadline = _float_env("LLM_DEADLINE", 20)       # total budget (< 30s request)
+    backoff = _float_env("LLM_RETRY_BACKOFF", 0.5)
+    cache_size = max(1, _int_env("LLM_CACHE_SIZE", 256))
 
     # Import lazily so the app boots even if the SDK is absent at import time.
     try:
         from openai import OpenAI
         import openai as openai_pkg
     except Exception as exc:  # pragma: no cover - import guard
-        raise LLMError(f"OpenAI SDK unavailable: {exc}") from exc
+        raise LLMError(f"OpenAI SDK unavailable: {type(exc).__name__}") from exc
 
     client_kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
     if base_url:
         client_kwargs["base_url"] = base_url
     client = OpenAI(**client_kwargs)
 
-    user_payload = json.dumps({"operator_notes": list(operator_notes)})
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": FEWSHOT_USER},
         {"role": "assistant", "content": FEWSHOT_ASSISTANT},
-        {"role": "user", "content": user_payload},
+        {"role": "user", "content": json.dumps({"operator_notes": notes})},
     ]
 
-    def _call(model_name):
-        """One attempt against a specific model. Raises LLMError on failure."""
+    def _call(model_name, call_timeout):
+        """One attempt. Raises LLMError (with .transient) on any failure."""
         try:
             response = client.chat.completions.create(
                 model=model_name,
                 temperature=0,
                 response_format={"type": "json_object"},
                 messages=messages,
-                timeout=timeout,
+                timeout=call_timeout,
             )
-        except openai_pkg.APITimeoutError as exc:
-            raise LLMError(f"LLM call timed out after {timeout}s.") from exc
-        except openai_pkg.APIError as exc:
-            raise LLMError(f"LLM provider error: {exc}") from exc
-        except Exception as exc:  # network/config/anything else
-            raise LLMError(f"LLM call failed: {exc}") from exc
+        except Exception as exc:
+            transient = _is_transient(exc, openai_pkg)
+            status = getattr(exc, "status_code", None)
+            # Keep the message short and secret-free (type + status only).
+            detail = f"{type(exc).__name__}" + (f" ({status})" if status else "")
+            raise _llm_error(f"LLM call failed: {detail}", transient) from exc
 
         try:
             content = response.choices[0].message.content
         except (AttributeError, IndexError) as exc:
-            raise LLMError("LLM response had no message content.") from exc
+            raise _llm_error("LLM response had no message content.") from exc
         if not content:
-            raise LLMError("LLM returned an empty response.")
+            raise _llm_error("LLM returned an empty response.")
         try:
             parsed = json.loads(content)
         except (json.JSONDecodeError, TypeError) as exc:
-            raise LLMError("LLM response was not valid JSON.") from exc
+            raise _llm_error("LLM response was not valid JSON.") from exc
 
         # JSON mode returns an object; unwrap the results array if present. The
         # payload is returned raw and untrusted beyond this structural unwrap.
@@ -218,12 +312,30 @@ def interpret_notes(operator_notes):
             return parsed["results"]
         return parsed
 
-    # Try the primary model, then the optional fallback if it fails.
+    # Try the primary model then the optional fallback; retry transient errors
+    # up to `max_retries` per model, all bounded by the overall deadline.
     models = [model] + ([fallback_model] if fallback_model else [])
-    last_error = None
-    for candidate in models:
-        try:
-            return _call(candidate)
-        except LLMError as exc:
-            last_error = exc
-    raise last_error
+    start = time.monotonic()
+    last_error: LLMError | None = None
+
+    for model_name in models:
+        for attempt in range(max_retries + 1):
+            remaining = deadline - (time.monotonic() - start)
+            if remaining <= 0.1:
+                raise _llm_error("LLM deadline exceeded.", transient=True)
+            try:
+                result = _call(model_name, min(timeout, remaining))
+                _cache_put(cache_key, result, cache_size)
+                return result
+            except LLMError as exc:
+                last_error = exc
+                if getattr(exc, "transient", False) and attempt < max_retries:
+                    logger.warning(
+                        "LLM transient error (model=%s attempt=%s); retrying: %s",
+                        model_name, attempt + 1, exc,
+                    )
+                    time.sleep(min(backoff, max(0.0, remaining - 0.1)))
+                    continue
+                break  # non-transient or retries exhausted -> next model
+
+    raise last_error or LLMError("LLM call failed with no error captured.")

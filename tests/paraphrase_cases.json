@@ -1,0 +1,160 @@
+{
+  "convention": "24 hour slots 0..23. A range 'A to B' covers hour A up to but NOT including hour B (endpoint-exclusive). solar_reduction.factor is the fraction of solar REMAINING after the cut. These notes are generic paraphrases, not copied from any public/judge case.",
+  "cases": [
+    {
+      "name": "solar_reduction/percent",
+      "notes": ["Cut solar output by 30% from noon to 4pm."],
+      "expected": [{"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.7}]
+    },
+    {
+      "name": "solar_reduction/24h-percent",
+      "notes": ["Between 12:00 and 16:00, reduce expected PV generation by 30 percent."],
+      "expected": [{"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.7}]
+    },
+    {
+      "name": "solar_reduction/scale-to",
+      "notes": ["Scale solar to 70% for the noon to 4pm window."],
+      "expected": [{"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.7}]
+    },
+    {
+      "name": "solar_reduction/fraction",
+      "notes": ["Expect 0.3 less sun from 12 to 16 hours; derate solar accordingly."],
+      "expected": [{"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.7}]
+    },
+    {
+      "name": "solar_reduction/half",
+      "notes": ["Heavy clouds midday: cut solar in half from noon to 4pm."],
+      "expected": [{"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.5}]
+    },
+
+    {
+      "name": "no_charge/plain",
+      "notes": ["Do not charge the battery from 5pm to 9pm."],
+      "expected": [{"directive_type": "no_charge", "hours": [17,18,19,20]}]
+    },
+    {
+      "name": "no_charge/24h",
+      "notes": ["No charging during the evening peak, 17:00 to 21:00."],
+      "expected": [{"directive_type": "no_charge", "hours": [17,18,19,20]}]
+    },
+    {
+      "name": "no_charge/avoid",
+      "notes": ["Avoid charging the battery between 5pm and 9pm."],
+      "expected": [{"directive_type": "no_charge", "hours": [17,18,19,20]}]
+    },
+    {
+      "name": "no_charge/hours-word",
+      "notes": ["Battery charging off from 17 to 21 hours."],
+      "expected": [{"directive_type": "no_charge", "hours": [17,18,19,20]}]
+    },
+
+    {
+      "name": "no_discharge/plain",
+      "notes": ["Do not discharge the battery from 9am to 1pm."],
+      "expected": [{"directive_type": "no_discharge", "hours": [9,10,11,12]}]
+    },
+    {
+      "name": "no_discharge/24h",
+      "notes": ["Hold the battery: no discharging between 09:00 and 13:00."],
+      "expected": [{"directive_type": "no_discharge", "hours": [9,10,11,12]}]
+    },
+    {
+      "name": "no_discharge/prevent",
+      "notes": ["Prevent battery discharge from 9am to 1pm."],
+      "expected": [{"directive_type": "no_discharge", "hours": [9,10,11,12]}]
+    },
+    {
+      "name": "no_discharge/keep-from",
+      "notes": ["Keep the battery from discharging, 9 to 13 hours."],
+      "expected": [{"directive_type": "no_discharge", "hours": [9,10,11,12]}]
+    },
+
+    {
+      "name": "minimum_battery_reserve/at-least",
+      "notes": ["Keep at least 5 kWh in the battery from midnight to 6am."],
+      "expected": [{"directive_type": "minimum_battery_reserve", "hours": [0,1,2,3,4,5], "reserve": 5.0}]
+    },
+    {
+      "name": "minimum_battery_reserve/24h",
+      "notes": ["Maintain a minimum battery reserve of 5 kWh between 0:00 and 6:00."],
+      "expected": [{"directive_type": "minimum_battery_reserve", "hours": [0,1,2,3,4,5], "reserve": 5.0}]
+    },
+    {
+      "name": "minimum_battery_reserve/below",
+      "notes": ["Don't let the battery drop below 5 kWh from 12am to 6am."],
+      "expected": [{"directive_type": "minimum_battery_reserve", "hours": [0,1,2,3,4,5], "reserve": 5.0}]
+    },
+    {
+      "name": "minimum_battery_reserve/floor",
+      "notes": ["Reserve floor of 5 kilowatt-hours from 0 to 6 hours."],
+      "expected": [{"directive_type": "minimum_battery_reserve", "hours": [0,1,2,3,4,5], "reserve": 5.0}]
+    },
+
+    {
+      "name": "max_grid/cap",
+      "notes": ["Cap grid import at 4 kWh from 6pm to 9pm."],
+      "expected": [{"directive_type": "max_grid", "hours": [18,19,20], "max_grid_kwh": 4.0}]
+    },
+    {
+      "name": "max_grid/24h",
+      "notes": ["Limit grid draw to 4 kWh between 18:00 and 21:00."],
+      "expected": [{"directive_type": "max_grid", "hours": [18,19,20], "max_grid_kwh": 4.0}]
+    },
+    {
+      "name": "max_grid/no-more-than",
+      "notes": ["No more than 4 kWh from the grid each hour, 18 to 21 hours."],
+      "expected": [{"directive_type": "max_grid", "hours": [18,19,20], "max_grid_kwh": 4.0}]
+    },
+    {
+      "name": "max_grid/restrict",
+      "notes": ["Restrict grid usage to 4 kWh from 6pm to 9pm."],
+      "expected": [{"directive_type": "max_grid", "hours": [18,19,20], "max_grid_kwh": 4.0}]
+    },
+
+    {
+      "name": "no_op/thanks",
+      "notes": ["Thanks everyone for the great work this week!"],
+      "expected": [{"directive_type": "no_op"}]
+    },
+    {
+      "name": "no_op/reminder",
+      "notes": ["Reminder: the safety inspection is scheduled for Monday."],
+      "expected": [{"directive_type": "no_op"}]
+    },
+    {
+      "name": "no_op/status",
+      "notes": ["The new monitoring dashboard looks great, nice job team."],
+      "expected": [{"directive_type": "no_op"}]
+    },
+    {
+      "name": "no_op/fyi",
+      "notes": ["FYI, the canteen will be closed tomorrow for maintenance."],
+      "expected": [{"directive_type": "no_op"}]
+    },
+
+    {
+      "name": "combo/overlapping-hours",
+      "notes": [
+        "Cut solar by 50% from noon to 4pm.",
+        "Cap grid import at 3 kWh from 2pm to 6pm."
+      ],
+      "expected": [
+        {"directive_type": "solar_reduction", "hours": [12,13,14,15], "factor": 0.5},
+        {"directive_type": "max_grid", "hours": [14,15,16,17], "max_grid_kwh": 3.0}
+      ]
+    },
+    {
+      "name": "combo/three-notes-with-distractor",
+      "notes": [
+        "Do not charge the battery from 6pm to 10pm.",
+        "Great job on the maintenance yesterday!",
+        "Keep at least 4 kWh reserve from 1am to 5am."
+      ],
+      "expected": [
+        {"directive_type": "no_charge", "hours": [18,19,20,21]},
+        {"directive_type": "no_op"},
+        {"directive_type": "minimum_battery_reserve", "hours": [1,2,3,4], "reserve": 4.0}
+      ]
+    }
+  ]
+}
